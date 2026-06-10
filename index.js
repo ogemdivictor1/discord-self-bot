@@ -1,3 +1,4 @@
+const express = require('express');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 require('dotenv').config();
 const { Client } = require('discord.js-selfbot-v13');
@@ -183,3 +184,6 @@ process.on('uncaughtException', (err) => {
 });
 
 client.login(process.env.USER_TOKEN);
+const app = express();
+app.get('/', (req, res) => res.send('Bot is running'));
+app.listen(3000, () => console.log('✅ Keep-alive server on port 3000'));
