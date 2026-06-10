@@ -3,7 +3,7 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 require('dotenv').config();
 const { Client } = require('discord.js-selfbot-v13');
 const axios = require('axios');
-const HttpProxyAgent = require('http-proxy-agent');
+const { HttpProxyAgent } = require('http-proxy-agent');
 
 // Proxy setup - optional
 const clientOptions = {};
