@@ -3,187 +3,242 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 require('dotenv').config();
 const { Client } = require('discord.js-selfbot-v13');
 const axios = require('axios');
-const { HttpProxyAgent } = require('http-proxy-agent');
 
-// Proxy setup - optional
-const clientOptions = {};
-if (process.env.PROXY_URL) {
-  const proxyAgent = new HttpsProxyAgent(process.env.PROXY_URL);
-  clientOptions.ws = { agent: proxyAgent };
+// -------------------- PROXY SETUP (WebSocket + HTTP) --------------------
+const proxyUrl = process.env.PROXY_URL;
+let httpsAgent = null;
+
+if (proxyUrl) {
+  httpsAgent = new HttpsProxyAgent(proxyUrl);
   console.log('🔐 Proxy enabled');
 }
 
+// WebSocket proxy for Discord connection
+const clientOptions = {};
+if (proxyUrl) {
+  clientOptions.ws = { agent: httpsAgent };
+}
 const client = new Client(clientOptions);
 
-const memberCounts = new Map();
-const memberSnapshots = new Map();
-let pollingTimeout = null;
+// -------------------- STATE MANAGEMENT --------------------
+const memberSnapshots = new Map();     // guildId -> Set of user IDs
+const lastPollTime = new Map();        // guildId -> timestamp (ms)
+const recentJoins = new Map();         // guildId -> Set of user IDs (detected via event)
+let pollingInterval = null;
 
-// Random interval between 20-40 seconds
-function getRandomInterval() {
-  return Math.floor(Math.random() * (40000 - 20000 + 1)) + 20000;
-}
+// Configuration
+const POLL_INTERVAL_SEC = parseInt(process.env.POLL_INTERVAL_SEC) || 300;  // 5 min backup
+const FAST_POLL_AFTER_JOIN_SEC = 60;   // Poll again 1 min after a join
+const EVENT_DELAY_MS = 300;            // Human-like jitter
 
-// Random delay utility
+// -------------------- UTILITIES --------------------
 function randomDelay(min, max) {
   const ms = Math.floor(Math.random() * (max - min + 1)) + min;
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Simulate user activity occasionally
 async function simulateActivity() {
   if (Math.random() > 0.7) {
-    client.user.setStatus('online');
+    await client.user.setStatus('online');
     console.log('📍 Simulated activity');
   }
 }
 
-// Send notification with retry logic (with proxy support for axios)
-async function sendNotificationWithRetry(payload, maxRetries = 3) {
+async function sendNotification(payload, maxRetries = 3) {
   for (let i = 0; i < maxRetries; i++) {
     try {
-      const config = {};
-      if (process.env.PROXY_URL) {
-        config.httpAgent = new HttpProxyAgent(process.env.PROXY_URL);
-        config.httpsAgent = new HttpsProxyAgent(process.env.PROXY_URL);
-      }
+      const config = proxyUrl ? { httpsAgent, timeout: 10000 } : { timeout: 10000 };
       await axios.post(process.env.NOTIFY_URL, payload, config);
-      console.log('✅ Notification sent!');
+      console.log(`✅ Notification: ${payload.username} joined ${payload.server}`);
       return;
     } catch (err) {
-      if (i < maxRetries - 1) {
-        await randomDelay(1000, 3000);
-        console.log(`🔄 Retrying notification... (${i + 1}/${maxRetries})`);
+      if (i === maxRetries - 1) {
+        console.error(`❌ Notify failed after ${maxRetries} retries:`, err.message);
       } else {
-        console.error(`❌ Failed to notify after ${maxRetries} attempts:`, err.message);
+        await randomDelay(1000, 3000);
+        console.log(`🔄 Retry ${i+1}/${maxRetries}`);
       }
     }
   }
 }
 
+// -------------------- FAST PATH: Gateway Event --------------------
+client.on('guildMemberAdd', async (member) => {
+  const guild = member.guild;
+  console.log(`⚡ INSTANT join: ${member.user.tag} in ${guild.name}`);
+
+  // Update snapshot immediately
+  let snapshot = memberSnapshots.get(guild.id);
+  if (snapshot) {
+    snapshot.add(member.user.id);
+    memberSnapshots.set(guild.id, snapshot);
+  } else {
+    await initializeGuild(guild);
+    snapshot = memberSnapshots.get(guild.id);
+    if (snapshot) snapshot.add(member.user.id);
+  }
+
+  // Track for re‑poll
+  if (!recentJoins.has(guild.id)) recentJoins.set(guild.id, new Set());
+  recentJoins.get(guild.id).add(member.user.id);
+
+  await randomDelay(EVENT_DELAY_MS, EVENT_DELAY_MS + 200);
+
+  const payload = {
+    server: guild.name,
+    serverId: guild.id,
+    username: member.user.tag,
+    userId: member.user.id,
+    joinedAt: member.joinedAt ? member.joinedAt.toISOString() : new Date().toISOString(),
+    source: 'event'
+  };
+  await sendNotification(payload);
+
+  // Fast re‑poll after join
+  setTimeout(() => {
+    if (client.guilds.cache.has(guild.id)) {
+      console.log(`🔍 Fast re-poll for ${guild.name}`);
+      pollGuild(guild, true);
+    }
+  }, FAST_POLL_AFTER_JOIN_SEC * 1000);
+});
+
+// -------------------- SAFE FETCH (with cache & timeout) --------------------
+async function safeFetchMembers(guild, forceFresh = false) {
+  const start = Date.now();
+  const cacheSize = guild.members.cache.size;
+  
+  if (!forceFresh && cacheSize > 0 && (Date.now() - (lastPollTime.get(guild.id) || 0)) < 60000) {
+    console.log(`[CACHE] ${guild.name} → ${cacheSize} members`);
+    return guild.members.cache;
+  }
+
+  try {
+    console.log(`[FETCH] ${guild.name} (~${guild.memberCount || '?'})`);
+    const members = await guild.members.fetch({ time: 30000, withPresences: false });
+    console.log(`[FETCH DONE] ${guild.name} in ${Date.now()-start}ms → ${members.size}`);
+    return members;
+  } catch (err) {
+    console.error(`[FETCH FAIL] ${guild.name}:`, err.message);
+    if (guild.members.cache.size > 0) {
+      console.log(`[FALLBACK] Using stale cache for ${guild.name}`);
+      return guild.members.cache;
+    }
+    throw err;
+  }
+}
+
+// -------------------- INITIALIZE --------------------
 async function initializeGuild(guild) {
   try {
-    const members = await guild.members.fetch();
-    memberCounts.set(guild.id, members.size);
-    const memberIds = new Set(members.map(m => m.user.id));
-    memberSnapshots.set(guild.id, memberIds);
-    console.log(`✅ Monitoring ${guild.name}: ${members.size} members`);
+    const members = await safeFetchMembers(guild, true);
+    memberSnapshots.set(guild.id, new Set(members.map(m => m.user.id)));
+    lastPollTime.set(guild.id, Date.now());
+    console.log(`✅ Initialized ${guild.name} (${members.size} members)`);
   } catch (err) {
-    console.error(`❌ Failed to initialize ${guild.name}:`, err.message);
+    console.error(`❌ Init failed ${guild.name}:`, err.message);
   }
 }
 
-async function pollGuild(guild) {
+// -------------------- BACKUP POLL (reconciliation) --------------------
+async function pollGuild(guild, forceFresh = false) {
   try {
-    const members = await guild.members.fetch();
-    const previousCount = memberCounts.get(guild.id) || 0;
-    const currentCount = members.size;
-    const previousSnapshot = memberSnapshots.get(guild.id) || new Set();
-
-    if (currentCount > previousCount) {
-      const newMembers = members.filter(m => !previousSnapshot.has(m.user.id));
-
-      for (const member of newMembers.values()) {
-        const payload = {
-          server: guild.name,
-          serverId: guild.id,
-          username: member.user.tag,
-          userId: member.user.id,
-          joinedAt: member.joinedAt ? member.joinedAt.toISOString() : new Date().toISOString(),
-        };
-
-        console.log(`🆕 New member in ${guild.name}: ${member.user.tag}`);
-
-        await randomDelay(500, 1500);
-        await sendNotificationWithRetry(payload);
-      }
-
-      const newSnapshot = new Set(members.map(m => m.user.id));
-      memberSnapshots.set(guild.id, newSnapshot);
-      memberCounts.set(guild.id, currentCount);
-
-    } else if (currentCount < previousCount) {
-      const newSnapshot = new Set(members.map(m => m.user.id));
-      memberSnapshots.set(guild.id, newSnapshot);
-      memberCounts.set(guild.id, currentCount);
-      console.log(`👋 Member left ${guild.name}. New count: ${currentCount}`);
-
-    } else {
-      console.log(`[${guild.name}] No changes. Members: ${currentCount}`);
-    }
-
-  } catch (err) {
-    console.error(`⚠️ Polling error for ${guild.name}:`, err.message);
-  }
-}
-
-async function startPolling() {
-  const interval = getRandomInterval();
-  console.log(`⏱️ Next poll in ${(interval / 1000).toFixed(1)}s`);
-
-  pollingTimeout = setTimeout(async () => {
-    if (Math.random() > 0.85) {
-      console.log('⏭️ Skipping this poll cycle');
-      startPolling();
+    const members = await safeFetchMembers(guild, forceFresh);
+    const previousSnapshot = memberSnapshots.get(guild.id);
+    const currentIds = new Set(members.map(m => m.user.id));
+    
+    if (!previousSnapshot) {
+      memberSnapshots.set(guild.id, currentIds);
+      lastPollTime.set(guild.id, Date.now());
       return;
     }
 
-    console.log(`[${new Date().toLocaleTimeString()}] Polling... checking all servers`);
-
-    await simulateActivity();
-
-    const guilds = [...client.guilds.cache.values()];
-
-    for (const guild of guilds) {
-      await pollGuild(guild);
-      await randomDelay(200, 500);
+    // Detect missed joins
+    const missedMembers = [];
+    for (const id of currentIds) {
+      if (!previousSnapshot.has(id)) {
+        const member = members.get(id);
+        if (member) missedMembers.push(member);
+      }
     }
 
-    startPolling();
-  }, interval);
+    recentJoins.delete(guild.id); // Clear after poll
+
+    for (const member of missedMembers) {
+      console.log(`🔄 POLL recovered missed join: ${member.user.tag} in ${guild.name}`);
+      const payload = {
+        server: guild.name,
+        serverId: guild.id,
+        username: member.user.tag,
+        userId: member.user.id,
+        joinedAt: member.joinedAt ? member.joinedAt.toISOString() : new Date().toISOString(),
+        source: 'poll'
+      };
+      await sendNotification(payload);
+    }
+
+    memberSnapshots.set(guild.id, currentIds);
+    lastPollTime.set(guild.id, Date.now());
+    console.log(`[${guild.name}] Poll OK – ${currentIds.size} members${missedMembers.length ? ` (recovered ${missedMembers.length})` : ''}`);
+  } catch (err) {
+    console.error(`⚠️ Poll error ${guild.name}:`, err.message);
+  }
 }
 
-client.on('ready', async () => {
-  console.log(`Selfbot running as ${client.user.tag}`);
-  console.log(`Monitoring ${client.guilds.cache.size} servers`);
-
+// -------------------- BACKUP SCHEDULER --------------------
+async function runBackupPoll() {
   const guilds = [...client.guilds.cache.values()];
+  console.log(`\n🔄 Backup poll (${guilds.length} guilds)...`);
+  for (let i = 0; i < guilds.length; i++) {
+    setTimeout(() => pollGuild(guilds[i], false), i * 2000);
+  }
+  await simulateActivity();
+}
 
+function startBackupPolling() {
+  if (pollingInterval) clearInterval(pollingInterval);
+  pollingInterval = setInterval(runBackupPoll, POLL_INTERVAL_SEC * 1000);
+  console.log(`⏱️ Backup poll every ${POLL_INTERVAL_SEC}s (staggered)`);
+}
+
+// -------------------- EVENT HANDLERS --------------------
+client.on('ready', async () => {
+  console.log(`🤖 Selfbot: ${client.user.tag} | ${client.guilds.cache.size} servers`);
+  const guilds = [...client.guilds.cache.values()];
   for (const guild of guilds) {
     await initializeGuild(guild);
-    await randomDelay(500, 1000);
+    await randomDelay(300, 800);
   }
-
-  console.log('✅ All servers initialized. Polling started...');
-  startPolling();
+  startBackupPolling();
 });
 
 client.on('guildCreate', async (guild) => {
-  console.log(`📡 Joined new server: ${guild.name}`);
+  console.log(`➕ Joined: ${guild.name}`);
   await initializeGuild(guild);
-  console.log(`✅ ${guild.name} added to monitoring automatically!`);
 });
 
 client.on('guildDelete', (guild) => {
-  memberCounts.delete(guild.id);
   memberSnapshots.delete(guild.id);
-  console.log(`🚪 Left: ${guild.name}. Removed from monitoring.`);
+  lastPollTime.delete(guild.id);
+  recentJoins.delete(guild.id);
+  console.log(`➖ Left: ${guild.name}`);
 });
 
-client.on('disconnect', () => {
-  console.log('⚠️ Bot disconnected. Stopping polling...');
-  if (pollingTimeout) clearTimeout(pollingTimeout);
+// -------------------- KEEP-ALIVE & STATS --------------------
+const app = express();
+app.get('/', (req, res) => res.json({ status: 'running', guilds: client.guilds.cache.size }));
+app.get('/stats', (req, res) => {
+  const stats = {};
+  for (const [id, snapshot] of memberSnapshots.entries()) {
+    const guild = client.guilds.cache.get(id);
+    stats[guild?.name || id] = { members: snapshot.size, lastPoll: lastPollTime.get(id) };
+  }
+  res.json(stats);
 });
+app.listen(3000, () => console.log('✅ Health server on :3000'));
 
-process.on('unhandledRejection', (err) => {
-  console.error('⚠️ Unhandled error:', err.message);
-});
-
-process.on('uncaughtException', (err) => {
-  console.error('⚠️ Uncaught exception:', err.message);
-});
+// -------------------- ERROR HANDLING --------------------
+process.on('unhandledRejection', (err) => console.error('⚠️ Unhandled rejection:', err.message));
+process.on('uncaughtException', (err) => console.error('⚠️ Uncaught exception:', err.message));
 
 client.login(process.env.USER_TOKEN);
-const app = express();
-app.get('/', (req, res) => res.send('Bot is running'));
-app.listen(3000, () => console.log('✅ Keep-alive server on port 3000'));
