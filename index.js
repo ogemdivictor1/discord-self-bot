@@ -1,8 +1,18 @@
+const { HttpsProxyAgent } = require('https-proxy-agent');
 require('dotenv').config();
 const { Client } = require('discord.js-selfbot-v13');
 const axios = require('axios');
+const HttpProxyAgent = require('http-proxy-agent');
 
-const client = new Client();
+// Proxy setup - optional
+const clientOptions = {};
+if (process.env.PROXY_URL) {
+  const proxyAgent = new HttpsProxyAgent(process.env.PROXY_URL);
+  clientOptions.ws = { agent: proxyAgent };
+  console.log('🔐 Proxy enabled');
+}
+
+const client = new Client(clientOptions);
 
 const memberCounts = new Map();
 const memberSnapshots = new Map();
@@ -27,11 +37,16 @@ async function simulateActivity() {
   }
 }
 
-// Send notification with retry logic
+// Send notification with retry logic (with proxy support for axios)
 async function sendNotificationWithRetry(payload, maxRetries = 3) {
   for (let i = 0; i < maxRetries; i++) {
     try {
-      await axios.post(process.env.NOTIFY_URL, payload);
+      const config = {};
+      if (process.env.PROXY_URL) {
+        config.httpAgent = new HttpProxyAgent(process.env.PROXY_URL);
+        config.httpsAgent = new HttpsProxyAgent(process.env.PROXY_URL);
+      }
+      await axios.post(process.env.NOTIFY_URL, payload, config);
       console.log('✅ Notification sent!');
       return;
     } catch (err) {
@@ -78,7 +93,6 @@ async function pollGuild(guild) {
 
         console.log(`🆕 New member in ${guild.name}: ${member.user.tag}`);
 
-        // Small jitter before notifying
         await randomDelay(500, 1500);
         await sendNotificationWithRetry(payload);
       }
@@ -102,14 +116,11 @@ async function pollGuild(guild) {
   }
 }
 
-// Recursive polling with new random interval each cycle
 async function startPolling() {
   const interval = getRandomInterval();
   console.log(`⏱️ Next poll in ${(interval / 1000).toFixed(1)}s`);
 
   pollingTimeout = setTimeout(async () => {
-
-    // 15% chance to skip this cycle
     if (Math.random() > 0.85) {
       console.log('⏭️ Skipping this poll cycle');
       startPolling();
@@ -118,17 +129,16 @@ async function startPolling() {
 
     console.log(`[${new Date().toLocaleTimeString()}] Polling... checking all servers`);
 
-    // Simulate activity occasionally
     await simulateActivity();
 
     const guilds = [...client.guilds.cache.values()];
 
     for (const guild of guilds) {
       await pollGuild(guild);
-      await randomDelay(200, 500); // stagger between guilds
+      await randomDelay(200, 500);
     }
 
-    startPolling(); // new random interval each cycle
+    startPolling();
   }, interval);
 }
 
@@ -147,27 +157,23 @@ client.on('ready', async () => {
   startPolling();
 });
 
-// Auto add new server when you join
 client.on('guildCreate', async (guild) => {
   console.log(`📡 Joined new server: ${guild.name}`);
   await initializeGuild(guild);
   console.log(`✅ ${guild.name} added to monitoring automatically!`);
 });
 
-// Auto remove server when you leave
 client.on('guildDelete', (guild) => {
   memberCounts.delete(guild.id);
   memberSnapshots.delete(guild.id);
   console.log(`🚪 Left: ${guild.name}. Removed from monitoring.`);
 });
 
-// Cleanup on disconnect
 client.on('disconnect', () => {
   console.log('⚠️ Bot disconnected. Stopping polling...');
   if (pollingTimeout) clearTimeout(pollingTimeout);
 });
 
-// Catch all errors without crashing
 process.on('unhandledRejection', (err) => {
   console.error('⚠️ Unhandled error:', err.message);
 });
