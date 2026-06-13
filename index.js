@@ -95,6 +95,11 @@ async function fetchAllMembersInChunks(guild) {
       break;
     }
   }
+
+  if (members.size === 0 && guild.memberCount > 5000) {
+    console.log(`[NOTE] ${guild.name} is a large server (${guild.memberCount}+ members) — Discord limits full member list fetch for regular user accounts. Real-time cache detection still active.`);
+  }
+
   console.log(`[DONE] ${guild.name} → ${members.size} members`);
   return members;
 }
@@ -187,15 +192,17 @@ client.on('guildDelete', (guild) => {
   console.log(`➖ Left: ${guild.name}`);
 });
 
-// ⭐ NEW: shardDisconnect — detects token death
+// shardDisconnect — detects token death
 client.on('shardDisconnect', (event, shardId) => {
   console.error(`🔴 SHARD DISCONNECTED (shard ${shardId}): code=${event.code} reason=${event.reason}`);
   if (event.code === 4004) {
+    console.error('================================');
     console.error('🔴 TOKEN EXPIRED – update USER_TOKEN immediately');
+    console.error('================================');
   }
 });
 
-// ⭐ NEW: Health + Stats endpoints
+// Health + Stats endpoints
 const app = express();
 
 app.get('/', (req, res) => {
@@ -211,7 +218,6 @@ app.get('/stats', async (req, res) => {
   try {
     const guilds = [...client.guilds.cache.values()];
     const stats = [];
-
     for (const guild of guilds) {
       const guildKey = `guild:${guild.id}:members`;
       const trackedCount = await redis.scard(guildKey);
@@ -222,7 +228,6 @@ app.get('/stats', async (req, res) => {
         trackedInRedis: trackedCount || 0
       });
     }
-
     res.json({
       totalGuilds: guilds.length,
       guilds: stats,
@@ -239,13 +244,24 @@ app.listen(3000, () => console.log('✅ Health server on :3000'));
 // Error handling
 process.on('unhandledRejection', (err) => {
   const msg = err.message?.toLowerCase() || '';
-  if (msg.includes('invalid token')) console.error('🔴 TOKEN EXPIRED – update USER_TOKEN');
-  else console.error('⚠️ Unhandled rejection:', err.message);
+  if (msg.includes('invalid token')) {
+    console.error('================================');
+    console.error('🔴 TOKEN EXPIRED – update USER_TOKEN');
+    console.error('================================');
+  } else {
+    console.error('⚠️ Unhandled rejection:', err.message);
+  }
 });
+
 process.on('uncaughtException', (err) => {
   const msg = err.message?.toLowerCase() || '';
-  if (msg.includes('invalid token')) console.error('🔴 TOKEN EXPIRED – update USER_TOKEN');
-  else console.error('⚠️ Uncaught exception:', err.message);
+  if (msg.includes('invalid token')) {
+    console.error('================================');
+    console.error('🔴 TOKEN EXPIRED – update USER_TOKEN');
+    console.error('================================');
+  } else {
+    console.error('⚠️ Uncaught exception:', err.message);
+  }
 });
 
 client.login(process.env.USER_TOKEN);
