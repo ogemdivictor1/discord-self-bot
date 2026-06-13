@@ -23,7 +23,7 @@ if (proxyUrl) clientOptions.ws = { agent: httpsAgent };
 const client = new Client(clientOptions);
 
 // Config
-const POLL_INTERVAL_SEC = 600;
+const POLL_INTERVAL_SEC = 120;
 const CHUNK_SIZE = 1000;
 const PAGE_DELAY_MS = 2000;
 const GRACE_PERIOD_MS = 5 * 60 * 1000;
@@ -169,7 +169,7 @@ async function runBackupPoll() {
   const guilds = [...client.guilds.cache.values()];
   console.log(`\n🔄 Starting poll cycle (${guilds.length} guilds)...`);
   for (let i = 0; i < guilds.length; i++) {
-    setTimeout(() => pollGuild(guilds[i]), i * 5000);
+    setTimeout(() => pollGuild(guilds[i]), i * 2000);
   }
   await simulateActivity();
 }
