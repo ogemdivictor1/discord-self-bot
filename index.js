@@ -224,6 +224,24 @@ client.on('guildDelete', (guild) => {
   console.log(`➖ Left: ${guild.name}`);
 });
 
+// -------------------- TOKEN EXPIRY DETECTION (ADDED) --------------------
+client.on('shardDisconnect', (event, shardID) => {
+  if (event?.code === 4004) {
+    console.error(`🔴 TOKEN EXPIRED mid-session (shard ${shardID}) — Update USER_TOKEN in Render env vars!`);
+  } else {
+    console.warn(`⚠️ Shard ${shardID} disconnected with code ${event?.code}`);
+  }
+});
+
+client.on('disconnect', (event) => {
+  if (event?.code === 4004) {
+    console.error('🔴 TOKEN EXPIRED — Update USER_TOKEN in Render env vars!');
+  } else {
+    console.warn('⚠️ Bot disconnected. Stopping polling...');
+    if (pollingInterval) clearInterval(pollingInterval);
+  }
+});
+
 // -------------------- KEEP-ALIVE & STATS --------------------
 const app = express();
 app.get('/', (req, res) => res.json({ status: 'running', guilds: client.guilds.cache.size }));
@@ -237,8 +255,21 @@ app.get('/stats', (req, res) => {
 });
 app.listen(3000, () => console.log('✅ Health server on :3000'));
 
-// -------------------- ERROR HANDLING --------------------
-process.on('unhandledRejection', (err) => console.error('⚠️ Unhandled rejection:', err.message));
-process.on('uncaughtException', (err) => console.error('⚠️ Uncaught exception:', err.message));
+// -------------------- ERROR HANDLING (UPDATED WITH TOKEN CHECK) --------------------
+process.on('unhandledRejection', (err) => {
+  if (err.message?.toLowerCase().includes('invalid token') || err.message?.toLowerCase().includes('an invalid token')) {
+    console.error('🔴 TOKEN EXPIRED — Update USER_TOKEN in Render env vars!');
+  } else {
+    console.error('⚠️ Unhandled rejection:', err.message);
+  }
+});
+
+process.on('uncaughtException', (err) => {
+  if (err.message?.toLowerCase().includes('invalid token') || err.message?.toLowerCase().includes('an invalid token')) {
+    console.error('🔴 TOKEN EXPIRED — Update USER_TOKEN in Render env vars!');
+  } else {
+    console.error('⚠️ Uncaught exception:', err.message);
+  }
+});
 
 client.login(process.env.USER_TOKEN);
