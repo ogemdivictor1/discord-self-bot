@@ -3,33 +3,34 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 require('dotenv').config();
 const { Client } = require('discord.js-selfbot-v13');
 const axios = require('axios');
+const { Redis } = require('@upstash/redis');
 
-// -------------------- PROXY SETUP (WebSocket + HTTP) --------------------
+// -------------------- REDIS (persistent member storage) --------------------
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
+// -------------------- PROXY SETUP --------------------
 const proxyUrl = process.env.PROXY_URL;
 let httpsAgent = null;
-
 if (proxyUrl) {
   httpsAgent = new HttpsProxyAgent(proxyUrl);
   console.log('🔐 Proxy enabled');
 }
 
-// WebSocket proxy for Discord connection
 const clientOptions = {};
-if (proxyUrl) {
-  clientOptions.ws = { agent: httpsAgent };
-}
+if (proxyUrl) clientOptions.ws = { agent: httpsAgent };
 const client = new Client(clientOptions);
 
-// -------------------- STATE MANAGEMENT --------------------
-const memberSnapshots = new Map();     // guildId -> Set of user IDs
-const lastPollTime = new Map();        // guildId -> timestamp (ms)
-const recentJoins = new Map();         // guildId -> Set of user IDs (detected via event)
+// -------------------- STATE (minimal in-memory) --------------------
 let pollingInterval = null;
+const lastPollTime = new Map();      // guildId -> timestamp (ms)
 
 // Configuration
-const POLL_INTERVAL_SEC = parseInt(process.env.POLL_INTERVAL_SEC) || 300;  // 5 min backup
-const FAST_POLL_AFTER_JOIN_SEC = 60;   // Poll again 1 min after a join
-const EVENT_DELAY_MS = 300;            // Human-like jitter
+const POLL_INTERVAL_SEC = parseInt(process.env.POLL_INTERVAL_SEC) || 300;
+const JOIN_RECOVERY_WINDOW_MIN = parseInt(process.env.JOIN_RECOVERY_WINDOW_MIN) || 30;
+const MAX_JOIN_AGE_MS = JOIN_RECOVERY_WINDOW_MIN * 60 * 1000;
 
 // -------------------- UTILITIES --------------------
 function randomDelay(min, max) {
@@ -62,135 +63,94 @@ async function sendNotification(payload, maxRetries = 3) {
   }
 }
 
-// -------------------- FAST PATH: Gateway Event --------------------
-client.on('guildMemberAdd', async (member) => {
-  const guild = member.guild;
-  console.log(`⚡ INSTANT join: ${member.user.tag} in ${guild.name}`);
-
-  // Update snapshot immediately
-  let snapshot = memberSnapshots.get(guild.id);
-  if (snapshot) {
-    snapshot.add(member.user.id);
-    memberSnapshots.set(guild.id, snapshot);
-  } else {
-    await initializeGuild(guild);
-    snapshot = memberSnapshots.get(guild.id);
-    if (snapshot) snapshot.add(member.user.id);
-  }
-
-  // Track for re‑poll
-  if (!recentJoins.has(guild.id)) recentJoins.set(guild.id, new Set());
-  recentJoins.get(guild.id).add(member.user.id);
-
-  await randomDelay(EVENT_DELAY_MS, EVENT_DELAY_MS + 200);
-
-  const payload = {
-    server: guild.name,
-    serverId: guild.id,
-    username: member.user.tag,
-    userId: member.user.id,
-    joinedAt: member.joinedAt ? member.joinedAt.toISOString() : new Date().toISOString(),
-    source: 'event'
-  };
-  await sendNotification(payload);
-
-  // Fast re‑poll after join
-  setTimeout(() => {
-    if (client.guilds.cache.has(guild.id)) {
-      console.log(`🔍 Fast re-poll for ${guild.name}`);
-      pollGuild(guild, true);
-    }
-  }, FAST_POLL_AFTER_JOIN_SEC * 1000);
-});
-
-// -------------------- SAFE FETCH (with cache & timeout) --------------------
-async function safeFetchMembers(guild, forceFresh = false) {
-  const start = Date.now();
-  const cacheSize = guild.members.cache.size;
-  
-  if (!forceFresh && cacheSize > 0 && (Date.now() - (lastPollTime.get(guild.id) || 0)) < 60000) {
-    console.log(`[CACHE] ${guild.name} → ${cacheSize} members`);
+// -------------------- FETCH MEMBERS (no stale cache) --------------------
+async function fetchMembers(guild, forceFresh = false) {
+  const now = Date.now();
+  if (!forceFresh && (now - (lastPollTime.get(guild.id) || 0)) < 60000) {
+    console.log(`[CACHE] ${guild.name} → ${guild.members.cache.size} members`);
     return guild.members.cache;
   }
-
   try {
     console.log(`[FETCH] ${guild.name} (~${guild.memberCount || '?'})`);
     const members = await guild.members.fetch({ time: 30000, withPresences: false });
-    console.log(`[FETCH DONE] ${guild.name} in ${Date.now()-start}ms → ${members.size}`);
+    console.log(`[FETCH DONE] ${guild.name} → ${members.size} members`);
+    lastPollTime.set(guild.id, now);
     return members;
   } catch (err) {
     console.error(`[FETCH FAIL] ${guild.name}:`, err.message);
-    if (guild.members.cache.size > 0) {
-      console.log(`[FALLBACK] Using stale cache for ${guild.name}`);
-      return guild.members.cache;
-    }
     throw err;
   }
 }
 
-// -------------------- INITIALIZE --------------------
-async function initializeGuild(guild) {
+// -------------------- POLL GUILD: incremental Redis storage + joinedAt check --------------------
+async function pollGuild(guild) {
   try {
-    const members = await safeFetchMembers(guild, true);
-    memberSnapshots.set(guild.id, new Set(members.map(m => m.user.id)));
-    lastPollTime.set(guild.id, Date.now());
-    console.log(`✅ Initialized ${guild.name} (${members.size} members)`);
-  } catch (err) {
-    console.error(`❌ Init failed ${guild.name}:`, err.message);
-  }
-}
+    const members = await fetchMembers(guild, false);
+    const guildKey = `guild:${guild.id}:members`;
+    const now = Date.now();
 
-// -------------------- BACKUP POLL (reconciliation) --------------------
-async function pollGuild(guild, forceFresh = false) {
-  try {
-    const members = await safeFetchMembers(guild, forceFresh);
-    const previousSnapshot = memberSnapshots.get(guild.id);
-    const currentIds = new Set(members.map(m => m.user.id));
-    
-    if (!previousSnapshot) {
-      memberSnapshots.set(guild.id, currentIds);
-      lastPollTime.set(guild.id, Date.now());
-      return;
+    const pipeline = redis.pipeline();
+    for (const [id] of members) {
+      pipeline.sismember(guildKey, id);
     }
+    const results = await pipeline.exec();
 
-    // Detect missed joins
-    const missedMembers = [];
-    for (const id of currentIds) {
-      if (!previousSnapshot.has(id)) {
-        const member = members.get(id);
-        if (member) missedMembers.push(member);
+    // Guard: handle potential Redis errors in pipeline
+    const isKnownArray = results.map(r => {
+      if (r[0]) {
+        console.error(`❌ Redis pipeline error for ${guild.name}:`, r[0]);
+        return 0; // assume not known on error
+      }
+      return r[1];
+    });
+
+    let newMemberCount = 0;
+    let idx = 0;
+    for (const [id, member] of members) {
+      const isKnown = isKnownArray[idx++];
+      if (!isKnown) {
+        await redis.sadd(guildKey, id);
+        newMemberCount++;
+
+        let shouldNotify = false;
+        const joinedAt = member.joinedAt ? new Date(member.joinedAt).getTime() : null;
+        if (joinedAt !== null) {
+          if (now - joinedAt <= MAX_JOIN_AGE_MS) {
+            shouldNotify = true;
+            console.log(`🆕 New member (recent join): ${member.user.tag} joined ${guild.name}`);
+          } else {
+            console.log(`📦 Old member discovered (joined ${Math.round((now-joinedAt)/60000)} min ago): ${member.user.tag} – not notifying`);
+          }
+        } else {
+          console.log(`⏭️ Ignored member without joinedAt: ${member.user.tag} in ${guild.name}`);
+        }
+
+        if (shouldNotify) {
+          const payload = {
+            server: guild.name,
+            serverId: guild.id,
+            guildId: guild.id,
+            userId: member.user.id,
+            username: member.user.tag,
+            joinedAt: member.joinedAt ? member.joinedAt.toISOString() : new Date().toISOString(),
+            source: 'poll'
+          };
+          await sendNotification(payload);
+        }
       }
     }
-
-    recentJoins.delete(guild.id); // Clear after poll
-
-    for (const member of missedMembers) {
-      console.log(`🔄 POLL recovered missed join: ${member.user.tag} in ${guild.name}`);
-      const payload = {
-        server: guild.name,
-        serverId: guild.id,
-        username: member.user.tag,
-        userId: member.user.id,
-        joinedAt: member.joinedAt ? member.joinedAt.toISOString() : new Date().toISOString(),
-        source: 'poll'
-      };
-      await sendNotification(payload);
-    }
-
-    memberSnapshots.set(guild.id, currentIds);
-    lastPollTime.set(guild.id, Date.now());
-    console.log(`[${guild.name}] Poll OK – ${currentIds.size} members${missedMembers.length ? ` (recovered ${missedMembers.length})` : ''}`);
+    console.log(`[${guild.name}] Poll OK – ${members.size} members, ${newMemberCount} new to DB`);
   } catch (err) {
     console.error(`⚠️ Poll error ${guild.name}:`, err.message);
   }
 }
 
-// -------------------- BACKUP SCHEDULER --------------------
+// -------------------- POLLING SCHEDULER --------------------
 async function runBackupPoll() {
   const guilds = [...client.guilds.cache.values()];
   console.log(`\n🔄 Backup poll (${guilds.length} guilds)...`);
   for (let i = 0; i < guilds.length; i++) {
-    setTimeout(() => pollGuild(guilds[i], false), i * 2000);
+    setTimeout(() => pollGuild(guilds[i]), i * 2000);
   }
   await simulateActivity();
 }
@@ -201,30 +161,31 @@ function startBackupPolling() {
   console.log(`⏱️ Backup poll every ${POLL_INTERVAL_SEC}s (staggered)`);
 }
 
-// -------------------- EVENT HANDLERS --------------------
+// -------------------- INITIALISE (no full fetch) --------------------
+async function initialiseAllGuilds() {
+  console.log('Initialising guilds – members will be discovered incrementally via Redis.');
+  for (const guild of client.guilds.cache.values()) {
+    console.log(`📁 ${guild.name} – ready for incremental discovery`);
+  }
+}
+
+// -------------------- DISCORD EVENT HANDLERS --------------------
 client.on('ready', async () => {
   console.log(`🤖 Selfbot: ${client.user.tag} | ${client.guilds.cache.size} servers`);
-  const guilds = [...client.guilds.cache.values()];
-  for (const guild of guilds) {
-    await initializeGuild(guild);
-    await randomDelay(300, 800);
-  }
+  await initialiseAllGuilds();
   startBackupPolling();
 });
 
 client.on('guildCreate', async (guild) => {
-  console.log(`➕ Joined: ${guild.name}`);
-  await initializeGuild(guild);
+  console.log(`➕ Joined new server: ${guild.name}`);
 });
 
 client.on('guildDelete', (guild) => {
-  memberSnapshots.delete(guild.id);
-  lastPollTime.delete(guild.id);
-  recentJoins.delete(guild.id);
+  redis.del(`guild:${guild.id}:members`).catch(console.error);
   console.log(`➖ Left: ${guild.name}`);
 });
 
-// -------------------- TOKEN EXPIRY DETECTION (ADDED) --------------------
+// -------------------- TOKEN EXPIRY DETECTION --------------------
 client.on('shardDisconnect', (event, shardID) => {
   if (event?.code === 4004) {
     console.error(`🔴 TOKEN EXPIRED mid-session (shard ${shardID}) — Update USER_TOKEN in Render env vars!`);
@@ -242,22 +203,27 @@ client.on('disconnect', (event) => {
   }
 });
 
-// -------------------- KEEP-ALIVE & STATS --------------------
+// -------------------- HEALTH & STATS SERVER --------------------
 const app = express();
 app.get('/', (req, res) => res.json({ status: 'running', guilds: client.guilds.cache.size }));
-app.get('/stats', (req, res) => {
+app.get('/stats', async (req, res) => {
   const stats = {};
-  for (const [id, snapshot] of memberSnapshots.entries()) {
-    const guild = client.guilds.cache.get(id);
-    stats[guild?.name || id] = { members: snapshot.size, lastPoll: lastPollTime.get(id) };
+  for (const guild of client.guilds.cache.values()) {
+    const count = await redis.scard(`guild:${guild.id}:members`);
+    stats[guild.name] = {
+      knownMembersInRedis: count,
+      lastPoll: lastPollTime.get(guild.id),
+      memberCount: guild.memberCount
+    };
   }
   res.json(stats);
 });
 app.listen(3000, () => console.log('✅ Health server on :3000'));
 
-// -------------------- ERROR HANDLING (UPDATED WITH TOKEN CHECK) --------------------
+// -------------------- ERROR HANDLING --------------------
 process.on('unhandledRejection', (err) => {
-  if (err.message?.toLowerCase().includes('invalid token') || err.message?.toLowerCase().includes('an invalid token')) {
+  const msg = err.message?.toLowerCase() || '';
+  if (msg.includes('invalid token') || msg.includes('an invalid token')) {
     console.error('🔴 TOKEN EXPIRED — Update USER_TOKEN in Render env vars!');
   } else {
     console.error('⚠️ Unhandled rejection:', err.message);
@@ -265,11 +231,13 @@ process.on('unhandledRejection', (err) => {
 });
 
 process.on('uncaughtException', (err) => {
-  if (err.message?.toLowerCase().includes('invalid token') || err.message?.toLowerCase().includes('an invalid token')) {
+  const msg = err.message?.toLowerCase() || '';
+  if (msg.includes('invalid token') || msg.includes('an invalid token')) {
     console.error('🔴 TOKEN EXPIRED — Update USER_TOKEN in Render env vars!');
   } else {
     console.error('⚠️ Uncaught exception:', err.message);
   }
 });
 
+// -------------------- START --------------------
 client.login(process.env.USER_TOKEN);
