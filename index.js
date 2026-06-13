@@ -5,37 +5,49 @@ const { Client } = require('discord.js-selfbot-v13');
 const axios = require('axios');
 const { Redis } = require('@upstash/redis');
 
-// -------------------- REDIS --------------------
+// Redis
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-// -------------------- PROXY (optional) --------------------
+// Proxy (optional)
 const proxyUrl = process.env.PROXY_URL;
 let httpsAgent = null;
 if (proxyUrl) {
   httpsAgent = new HttpsProxyAgent(proxyUrl);
   console.log('🔐 Proxy enabled');
 }
-
 const clientOptions = {};
 if (proxyUrl) clientOptions.ws = { agent: httpsAgent };
 const client = new Client(clientOptions);
 
-// -------------------- HARDCODED CONFIG (no env clutter) --------------------
-const POLL_INTERVAL_SEC = 600;               // 10 minutes
-const JOIN_RECOVERY_WINDOW_MIN = 30;         // only notify joins within last 30 min
-const MAX_JOIN_AGE_MS = JOIN_RECOVERY_WINDOW_MIN * 60 * 1000;
-const CHUNK_SIZE = 1000;                     // members per request
-const PAGE_DELAY_MS = 2000;                  // delay between chunks
+// Config
+const POLL_INTERVAL_SEC = 600;
+const CHUNK_SIZE = 1000;
+const PAGE_DELAY_MS = 2000;
+const GRACE_PERIOD_MS = 5 * 60 * 1000;
 
 let pollingInterval = null;
+let START_TIME = null;
 
-// -------------------- UTILITIES --------------------
+// Persistent start time
+async function getStartTime() {
+  let start = await redis.get('global:start_time');
+  if (!start) {
+    start = Date.now();
+    await redis.set('global:start_time', start);
+    console.log(`🕒 First run – start time = ${new Date(start).toISOString()}`);
+  } else {
+    start = parseInt(start);
+    console.log(`🕒 Existing start time = ${new Date(start).toISOString()}`);
+  }
+  return start;
+}
+
+// Utilities
 function randomDelay(min, max) {
-  const ms = Math.floor(Math.random() * (max - min + 1)) + min;
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min));
 }
 
 async function simulateActivity() {
@@ -59,7 +71,7 @@ async function sendNotification(payload, maxRetries = 3) {
   }
 }
 
-// -------------------- CHUNKED FETCH --------------------
+// Chunked fetch
 async function fetchAllMembersInChunks(guild) {
   const members = new Map();
   let lastUserId = undefined;
@@ -87,49 +99,67 @@ async function fetchAllMembersInChunks(guild) {
   return members;
 }
 
-// -------------------- POLL GUILD --------------------
+// Poll guild
 async function pollGuild(guild) {
   console.log(`\n🔍 Polling ${guild.name}...`);
-  const start = Date.now();
+  const pollStart = Date.now();
   const members = await fetchAllMembersInChunks(guild);
   if (members.size === 0) return;
 
   const guildKey = `guild:${guild.id}:members`;
-  const now = Date.now();
-  let newCount = 0, notified = 0;
+  const isFirstScan = (await redis.exists(guildKey)) === 0;
 
-  // Check membership in Redis (batch using pipeline)
+  const memberIds = Array.from(members.keys());
   const pipeline = redis.pipeline();
-  for (const [id] of members) pipeline.sismember(guildKey, id);
-  const results = await pipeline.exec();
+  for (const id of memberIds) {
+    pipeline.sismember(guildKey, id);
+  }
 
+  let results;
+  try {
+    results = await pipeline.exec();
+  } catch (err) {
+    console.error(`[PIPELINE ERROR] ${guild.name}:`, err.message);
+    return;
+  }
+
+  const newIds = [];
+  const notifications = [];
   let idx = 0;
+
   for (const [id, member] of members) {
-    const isKnown = results[idx++][1];
+    const isKnown = results[idx++];
     if (!isKnown) {
-      newCount++;
-      await redis.sadd(guildKey, id);
-      const joinedAt = member.joinedAt ? member.joinedAt.getTime() : null;
-      if (joinedAt && (now - joinedAt) <= MAX_JOIN_AGE_MS) {
-        notified++;
-        console.log(`🆕 ${member.user.tag} joined recently – notifying`);
-        await sendNotification({
+      newIds.push(id);
+      const joinedAt = member.joinedAt?.getTime() ?? 0;
+      const effectiveStart = START_TIME - GRACE_PERIOD_MS;
+
+      if (!isFirstScan && joinedAt > effectiveStart) {
+        console.log(`🆕 NEW member: ${member.user.tag} (joined ${new Date(joinedAt).toISOString()})`);
+        notifications.push({
           server: guild.name,
           serverId: guild.id,
           userId: member.user.id,
           username: member.user.tag,
-          joinedAt: member.joinedAt?.toISOString() || new Date().toISOString(),
+          joinedAt: new Date(joinedAt).toISOString(),
           source: 'poll'
         });
       } else {
-        console.log(`📦 Added old member: ${member.user.tag} (joined ${joinedAt ? Math.round((now-joinedAt)/60000) : '?'} min ago)`);
+        console.log(`📦 ${isFirstScan ? 'Baseline' : 'Old'} member: ${member.user.tag}`);
       }
     }
   }
-  console.log(`[${guild.name}] Done in ${((Date.now()-start)/1000).toFixed(1)}s – ${members.size} members, ${newCount} new (${notified} notified)`);
+
+  if (newIds.length) {
+    await redis.sadd(guildKey, ...newIds);
+  }
+  await Promise.all(notifications.map(payload => sendNotification(payload)));
+
+  const elapsed = ((Date.now() - pollStart) / 1000).toFixed(1);
+  console.log(`[${guild.name}] ${isFirstScan ? 'BASELINE' : 'Incremental'} done in ${elapsed}s – ${members.size} total, ${newIds.length} new, ${notifications.length} notified`);
 }
 
-// -------------------- POLLING SCHEDULER --------------------
+// Polling scheduler
 async function runBackupPoll() {
   const guilds = [...client.guilds.cache.values()];
   console.log(`\n🔄 Starting poll cycle (${guilds.length} guilds)...`);
@@ -145,8 +175,9 @@ function startPolling() {
   console.log(`⏱️ Polling every ${POLL_INTERVAL_SEC}s (chunked, ${CHUNK_SIZE}/page, ${PAGE_DELAY_MS}ms delay)`);
 }
 
-// -------------------- DISCORD EVENTS --------------------
+// Discord events
 client.on('ready', async () => {
+  START_TIME = await getStartTime();
   console.log(`\n🤖 Selfbot: ${client.user.tag} | ${client.guilds.cache.size} servers`);
   startPolling();
 });
@@ -156,18 +187,64 @@ client.on('guildDelete', (guild) => {
   console.log(`➖ Left: ${guild.name}`);
 });
 
-// -------------------- HEALTH SERVER --------------------
+// ⭐ NEW: shardDisconnect — detects token death
+client.on('shardDisconnect', (event, shardId) => {
+  console.error(`🔴 SHARD DISCONNECTED (shard ${shardId}): code=${event.code} reason=${event.reason}`);
+  if (event.code === 4004) {
+    console.error('🔴 TOKEN EXPIRED – update USER_TOKEN immediately');
+  }
+});
+
+// ⭐ NEW: Health + Stats endpoints
 const app = express();
-app.get('/', (req, res) => res.json({ status: 'running', guilds: client.guilds.cache.size }));
+
+app.get('/', (req, res) => {
+  res.json({
+    status: 'running',
+    guilds: client.guilds.cache.size,
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/stats', async (req, res) => {
+  try {
+    const guilds = [...client.guilds.cache.values()];
+    const stats = [];
+
+    for (const guild of guilds) {
+      const guildKey = `guild:${guild.id}:members`;
+      const trackedCount = await redis.scard(guildKey);
+      stats.push({
+        name: guild.name,
+        id: guild.id,
+        memberCount: guild.memberCount,
+        trackedInRedis: trackedCount || 0
+      });
+    }
+
+    res.json({
+      totalGuilds: guilds.length,
+      guilds: stats,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('❌ /stats error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(3000, () => console.log('✅ Health server on :3000'));
 
-// -------------------- ERROR HANDLING --------------------
+// Error handling
 process.on('unhandledRejection', (err) => {
-  if (err.message?.toLowerCase().includes('invalid token')) console.error('🔴 TOKEN EXPIRED');
+  const msg = err.message?.toLowerCase() || '';
+  if (msg.includes('invalid token')) console.error('🔴 TOKEN EXPIRED – update USER_TOKEN');
   else console.error('⚠️ Unhandled rejection:', err.message);
 });
 process.on('uncaughtException', (err) => {
-  if (err.message?.toLowerCase().includes('invalid token')) console.error('🔴 TOKEN EXPIRED');
+  const msg = err.message?.toLowerCase() || '';
+  if (msg.includes('invalid token')) console.error('🔴 TOKEN EXPIRED – update USER_TOKEN');
   else console.error('⚠️ Uncaught exception:', err.message);
 });
 
