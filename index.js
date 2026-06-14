@@ -34,6 +34,7 @@ async function getStartTime() {
     }
     return start;
   } catch (err) {
+    console.error('❌ [Storage Sync Error] Baseline recovery failed, using local runtime clock:', err.message);
     return Date.now();
   }
 }
@@ -53,15 +54,21 @@ async function sendNotification(payload) {
 // 🎣 THE CENTRAL CORE: PROCESS AND FILTER DISCOVERED USERS
 // ────────────────────────────────────────────────────────
 async function processDiscoveredMembers(guild, memberMap, sourceLabel) {
-  if (!guild || memberMap.size === 0) return;
+  if (!START_TIME) {
+    console.warn(`⚠️ [Central Processor Guard] Dropping batch from [${sourceLabel}] - Engine initializing.`);
+    return;
+  }
+  if (!guild || !memberMap || memberMap.size === 0) return;
 
   const guildKey = `guild:${guild.id}:members`;
   const effectiveStart = START_TIME - GRACE_PERIOD_MS;
-  const memberArray = Array.from(memberMap.values());
+  
+  const memberArray = Array.from(memberMap.values()).filter(m => m && m.user && m.id);
+  if (memberArray.length === 0) return;
 
   const pipeline = redis.pipeline();
   for (const member of memberArray) {
-    if (member && member.id) pipeline.sismember(guildKey, member.id);
+    pipeline.sismember(guildKey, member.id);
   }
   
   let redisResults;
@@ -77,15 +84,14 @@ async function processDiscoveredMembers(guild, memberMap, sourceLabel) {
 
   for (let i = 0; i < memberArray.length; i++) {
     const member = memberArray[i];
-    if (!member || !member.user) continue;
-    
     const isKnown = redisResults[i]; 
-    const joinedAt = member.joinedAt?.getTime() ?? 0;
+    
+    if (!member.joinedAt) continue; 
+    const joinedAt = member.joinedAt.getTime();
 
     if (!isKnown) {
       newIdsToTrack.push(member.id);
 
-      // The Final Gatekeeper: joinedAt timestamp verification
       if (joinedAt > effectiveStart) {
         console.log(`🎯 [TIMESTAMP HIT] -> Identified brand new user [${member.user.tag}] via [${sourceLabel}] inside [${guild.name}]`);
         notifications.push({
@@ -101,7 +107,12 @@ async function processDiscoveredMembers(guild, memberMap, sourceLabel) {
   }
 
   if (newIdsToTrack.length > 0) {
-    await redis.sadd(guildKey, ...newIdsToTrack).catch(() => {});
+    try {
+      await redis.sadd(guildKey, ...newIdsToTrack);
+    } catch (err) {
+      console.error(`❌ [CENTRAL STORAGE WRITE ERROR] Failed committing unique IDs to Redis keyspace for [${guild.name}]:`, err.message);
+      return; 
+    }
   }
 
   if (notifications.length > 0) {
@@ -121,28 +132,31 @@ async function pollGuildActiveEngine(guild) {
     const baseTargets = ['2026', '2025', 'sol', 'eth', 'dev', 'the', 'a', 'e', 's', 'i', 'o'];
     const growthTargets = ['crypto', 'nft', 'trade', 'alpha', 'call', 'vc', 'lfg', 'he'];
 
-    // ACTIVE STRATEGY A: Small Server Multi-Seed Search Sweep
     if (guild.memberCount < 2000) {
       console.log(`🧹 [ACTIVE STRATEGY A] -> Group size under 2000. Initiating rapid multi-seed fishing lines...`);
       const randomSeeds = growthTargets.sort(() => 0.5 - Math.random()).slice(0, 3);
       
       for (const seed of randomSeeds) {
         console.log(`⏳ [ACTIVE ENGINE] -> Casting keyword search: ['${seed}']`);
-        const fetchSlice = await guild.members.fetch({ query: seed, limit: 100, time: 8000, withPresences: false }).catch(() => null);
+        const fetchSlice = await guild.members.fetch({ query: seed, limit: 100, time: 8000, withPresences: false }).catch((err) => {
+          console.error(`❌ [Active Search Failure] Fetch for seed ['${seed}'] aborted in [${guild.name}]:`, err.message);
+          return null;
+        });
         if (fetchSlice && fetchSlice.size > 0) {
           console.log(`✅ [ACTIVE ENGINE SUCCESS] -> Found ${fetchSlice.size} profiles via keyword ['${seed}']`);
           fetchSlice.forEach(m => activeGathered.set(m.id, m));
         }
         await new Promise(r => setTimeout(r, 800));
       }
-
-    // ACTIVE STRATEGY B: Large Server Dual Keyword Search Sweep
     } else {
       console.log(`⚠️ [ACTIVE STRATEGY B] -> Server size exceeds safety threshold. Executing dual cross-section queries...`);
 
       const kw1 = baseTargets[Math.floor(Math.random() * baseTargets.length)];
       console.log(`⏳ [ACTIVE ENGINE] -> Casting primary pass query: ['${kw1}'] (Limit: 50)`);
-      const slice1 = await guild.members.fetch({ query: kw1, limit: 50, time: 10000, withPresences: false }).catch(() => null);
+      const slice1 = await guild.members.fetch({ query: kw1, limit: 50, time: 10000, withPresences: false }).catch((err) => {
+        console.error(`❌ [Active Search Failure] Pass 1 check aborted in [${guild.name}]:`, err.message);
+        return null;
+      });
       if (slice1 && slice1.size > 0) {
         console.log(`✅ [ACTIVE ENGINE SUCCESS] -> Primary pass ['${kw1}'] caught ${slice1.size} unique targets.`);
         slice1.forEach(m => activeGathered.set(m.id, m));
@@ -154,17 +168,23 @@ async function pollGuildActiveEngine(guild) {
       while (kw2 === kw1) kw2 = baseTargets[Math.floor(Math.random() * baseTargets.length)];
 
       console.log(`⏳ [ACTIVE ENGINE] -> Casting secondary pass query: ['${kw2}'] (Limit: 50)`);
-      const slice2 = await guild.members.fetch({ query: kw2, limit: 50, time: 10000, withPresences: false }).catch(() => null);
+      const slice2 = await guild.members.fetch({ query: kw2, limit: 50, time: 10000, withPresences: false }).catch((err) => {
+        console.error(`❌ [Active Search Failure] Pass 2 check aborted in [${guild.name}]:`, err.message);
+        return null;
+      });
       if (slice2 && slice2.size > 0) {
         console.log(`✅ [ACTIVE ENGINE SUCCESS] -> Secondary pass ['${kw2}'] caught ${slice2.size} unique targets.`);
         slice2.forEach(m => activeGathered.set(m.id, m));
       }
     }
 
-    // NET 20: Audit Log Sneak Peek (Triggered during the server's loop cycle)
+    // NET 20: Audit Log Sneak Peek Check
     try {
       console.log(`🕵️‍♂️ [NET 20: Audit Log Sneak] -> Poking backend audit tables for hidden join activity footprints...`);
-      const auditLogs = await guild.fetchAuditLogs({ limit: 5 }).catch(() => null);
+      const auditLogs = await guild.fetchAuditLogs({ limit: 5 }).catch((err) => {
+        console.error(`❌ [NET 20 ERROR] Failed to gather structural audit records for [${guild.name}]:`, err.message);
+        return null;
+      });
       if (auditLogs && auditLogs.entries.size > 0) {
         const auditMap = new Map();
         for (const entry of auditLogs.entries.values()) {
@@ -178,7 +198,9 @@ async function pollGuildActiveEngine(guild) {
           await processDiscoveredMembers(guild, auditMap, 'NET_20_AUDIT_LOG_SNEAK');
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error(`❌ [NET 20 EXCEPTION] Secondary process thread failed during audit parse:`, e.message);
+    }
 
     const strategyLabel = guild.memberCount < 2000 ? 'ACTIVE_NET_STRATEGY_A_LOOP' : 'ACTIVE_NET_STRATEGY_B_LOOP';
     await processDiscoveredMembers(guild, activeGathered, strategyLabel);
@@ -196,59 +218,163 @@ async function startActiveLoopCycle() {
   console.log(`============================================================`);
 
   for (const guild of guilds) {
-    await pollGuildActiveEngine(guild);
+    try {
+      await pollGuildActiveEngine(guild);
+    } catch (err) {
+      console.error(`❌ [Loop Scheduler Fault] Execution completely broke down on guild [${guild.name || guild.id}]:`, err.message);
+    }
     
-    // Human Simulation Trait: Enforces realistic navigation delays between workspace swaps
     const humanDelay = Math.floor(Math.random() * (14000 - 8000 + 1) + 8000);
     console.log(`💤 [Human Simulator Delay] Pausing for ${(humanDelay / 1000).toFixed(1)}s before checking next guild panel...`);
     await new Promise(r => setTimeout(r, humanDelay));
   }
 
-  // Jittered Polling: Randomized timer interval variations to bypass cloud firewall detection loops
   const jitteredIntervalSec = Math.floor(Math.random() * (115 - 75 + 1) + 75);
   console.log(`🏁 [Loop Scheduler] Run complete. Sleeping loop for ${jitteredIntervalSec}s via variable clock jitter.`);
   setTimeout(startActiveLoopCycle, jitteredIntervalSec * 1000);
 }
 
 // ────────────────────────────────────────────────────────
+// 🔄 ENGINE 1B: ADVANCED SCHEDULE REFRESH WORKERS
+// ────────────────────────────────────────────────────────
+
+// NET 24: Lurker History Message Resync Engine (With Dynamic Backoff & Non-Overlapping Windows)
+async function syncChannelMembersLoop() {
+  const loopStart = Date.now();
+  console.log(`⚙️ [NET 24: Channel Activity Resync] Initiating text backlog sweep across workspaces...`);
+  
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      let channelCount = 0;
+      const validChannels = [...guild.channels.cache.values()].filter(c => c.isText && !c.isDM && c.viewable);
+      
+      for (const channel of validChannels) {
+        // Dynamic adaptive backoff configuration based on total channel visibility arrays
+        const adaptiveDelay = Math.max(500, 5000 / validChannels.length);
+        await new Promise(r => setTimeout(r, adaptiveDelay));
+
+        const recentMsgs = await channel.messages.fetch({ limit: 25 }).catch(() => null);
+        if (recentMsgs && recentMsgs.size > 0) {
+          const memberMap = new Map();
+          recentMsgs.forEach(msg => {
+            if (msg.member && !msg.author.bot) memberMap.set(msg.member.id, msg.member);
+          });
+          if (memberMap.size > 0) {
+            await processDiscoveredMembers(guild, memberMap, 'NET_24_CHANNEL_ACTIVITY_RESYNC');
+          }
+        }
+        channelCount++;
+      }
+      console.log(`✅ [NET 24 Engine] Completed audit pass covering ${channelCount} total layout channels inside [${guild.name}]`);
+    } catch (err) {
+      console.error(`❌ [NET 24 Error] Sweep failed on guild ${guild.name}:`, err.message);
+    }
+  }
+
+  const executionDuration = Date.now() - loopStart;
+  const standardInterval = 30 * 60 * 1000;
+  const adaptiveNextInterval = Math.max(5000, standardInterval - executionDuration);
+  console.log(`⏱️ [NET 24 Loop Metrics] Run finished in ${(executionDuration / 1000).toFixed(1)}s. Rescheduling next window in ${(adaptiveNextInterval / 1000).toFixed(1)}s.`);
+  setTimeout(syncChannelMembersLoop, adaptiveNextInterval);
+}
+
+// NET 27: Scheduled Discord Events Attendee Net (With Overlap Safeguards)
+async function scanScheduledEventsLoop() {
+  const loopStart = Date.now();
+  console.log(`⚙️ [NET 27: Event Subscriber Scan] Checking server scheduled RSVP channels...`);
+  
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const events = await guild.scheduledEvents.fetch().catch(() => null);
+      if (!events || events.size === 0) continue;
+
+      for (const event of events.values()) {
+        const attendees = await event.fetchSubscribers().catch((err) => {
+          console.error(`❌ [NET 27 Non-Fatal] Failed parsing subscriber registry tracking for [${event.name}]:`, err.message);
+          return null;
+        });
+        if (attendees && attendees.size > 0) {
+          const memberMap = new Map();
+          for (const subscriber of attendees.values()) {
+            if (!subscriber.user.bot) {
+              const member = await guild.members.fetch(subscriber.user.id).catch(() => null);
+              if (member) memberMap.set(member.id, member);
+            }
+          }
+          if (memberMap.size > 0) {
+            console.log(`🎙️ [NET 27: Scheduled Events] -> Caught ${memberMap.size} attendees inside [${guild.name}]`);
+            await processDiscoveredMembers(guild, memberMap, 'NET_27_SCHEDULED_EVENT_SUBSCRIBERS');
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`❌ [NET 27 Error] Event sweep failed on guild ${guild.name}:`, err.message);
+    }
+  }
+
+  const executionDuration = Date.now() - loopStart;
+  const standardInterval = 20 * 60 * 1000;
+  const adaptiveNextInterval = Math.max(5000, standardInterval - executionDuration);
+  console.log(`⏱️ [NET 27 Loop Metrics] Run finished in ${(executionDuration / 1000).toFixed(1)}s. Rescheduling next window in ${(adaptiveNextInterval / 1000).toFixed(1)}s.`);
+  setTimeout(scanScheduledEventsLoop, adaptiveNextInterval);
+}
+
+// ────────────────────────────────────────────────────────
 // 🎙️ ENGINE 2: PASSIVE NETS (LIVE GATEWAY PACKET LISTENERS)
 // ────────────────────────────────────────────────────────
 
-// NET 1 & NET 19: Native Joins + Premium Client Status Updates
+// NET 1 & NET 30 Consolidated: Single-Point Join Execution (Eliminates Race Conditions)
 client.on('guildMemberAdd', async (member) => {
   if (member.user.bot) return;
-  console.log(`🎙️ [NET 1: Front Door Welcomer] -> Target [${member.user.tag}] tripped entrance gateway in [${member.guild.name}]`);
-  await processDiscoveredMembers(member.guild, new Map([[member.id, member]]), 'NET_1_GUILD_MEMBER_ADD');
+  console.log(`🎙️ [NET 1 + NET 30: Join & Profile Synchronization] -> Tracking [${member.user.tag}] stepping inside [${member.guild.name}]`);
+  
+  try {
+    // Explicit metadata layout flush from user API registry
+    await client.users.fetch(member.user.id, { force: true });
+  } catch (err) {
+    console.warn(`⚠️ [NET 30 Warning] Force user context profile lookup failed:`, err.message);
+  }
+
+  await processDiscoveredMembers(member.guild, new Map([[member.id, member]]), 'NET_1_GUILD_MEMBER_ADD_WITH_PROFILE_SYNC');
 });
 
+// NET 2, NET 19 & NET 26: Unified Roster Role Modification and Trait Hooks
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
   if (newMember.user.bot) return;
   
-  // NET 19: Premium Hidden Channel Booster Net
   const oldRoles = oldMember?.roles?.cache ?? new Map();
   const newRoles = newMember.roles.cache;
+  
+  // NET 19: Check for pure size addition
   if (newRoles.size > oldRoles.size) {
     console.log(`🎙️ [NET 19: Hidden Channels Welcome] -> Role mutation shift isolated on [${newMember.user.tag}] in [${newMember.guild.name}]`);
     await processDiscoveredMembers(newMember.guild, new Map([[newMember.id, newMember]]), 'NET_19_PREMIUM_ROLE_BOOST');
     return;
   }
   
-  // NET 2: Standard Roster Profile Update Catch
+  // NET 26: Strict configuration change checking (V13 Compatible structural comparison)
+  const oldRoleArrayStr = [...oldRoles.keys()].sort().join(',');
+  const newRoleArrayStr = [...newRoles.keys()].sort().join(',');
+  if (oldRoleArrayStr !== newRoleArrayStr) {
+    console.log(`🎙️ [NET 26: Role Sync Detector] -> Complex role structure array changed for [${newMember.user.tag}] in [${newMember.guild.name}]`);
+    await processDiscoveredMembers(newMember.guild, new Map([[newMember.id, newMember]]), 'NET_26_ROLE_CONFIG_MUTATION');
+    return;
+  }
+  
   console.log(`🎙️ [NET 2: Profile Changer] -> Data field alteration caught for [${newMember.user.tag}] inside [${newMember.guild.name}]`);
   await processDiscoveredMembers(newMember.guild, new Map([[newMember.id, newMember]]), 'NET_2_GUILD_MEMBER_UPDATE');
 });
 
-// NET 3, NET 4, & NET 22: Live Chat Text Streams + Verification Mention Scraping
+// NET 3, NET 4, NET 22 & NET 25: Live Message Analytics and Multi-Vector Extraction Engine
 client.on('messageCreate', async (message) => {
   if (!message.guild) return;
 
-  // NET 22: Webhook & Bot Mention Mirror Scraper
+  // Bot & Webhook Processing Layer
   if (message.author.bot || message.webhookId) {
     const rawContent = message.content || '';
     const embedContent = message.embeds?.map(e => `${e.title || ''} ${e.description || ''}`).join(' ') || '';
     const consolidatedText = `${rawContent} ${embedContent}`;
     
-    // Check if the automated robot logs mention user IDs or tags
     const idRegex = /\b(\d{17,19})\b/g;
     let matches = [...consolidatedText.matchAll(idRegex)].map(m => m[1]);
     
@@ -263,16 +389,40 @@ client.on('messageCreate', async (message) => {
         await processDiscoveredMembers(message.guild, parsedMap, 'NET_22_BOT_MENTION_SCRAPER');
       }
     }
+
+    // NET 25: Indirect Embed Author & Footer Metadata Scraper
+    const embedMentions = new Set();
+    message.embeds.forEach(embed => {
+      if (embed.footer?.text) {
+        const footMatches = embed.footer.text.match(/\b(\d{17,19})\b/g);
+        if (footMatches) footMatches.forEach(id => embedMentions.add(id));
+      }
+      if (embed.author?.name) {
+        const authMatches = embed.author.name.match(/\b(\d{17,19})\b/g);
+        if (authMatches) authMatches.forEach(id => embedMentions.add(id));
+      }
+    });
+
+    if (embedMentions.size > 0) {
+      const embedMap = new Map();
+      for (const userId of embedMentions) {
+        const member = await message.guild.members.fetch(userId).catch(() => null);
+        if (member && !member.user.bot) embedMap.set(member.id, member);
+      }
+      if (embedMap.size > 0) {
+        console.log(`🎙️ [NET 25: Embed Metadata Scraper] -> Extracted ${embedMap.size} IDs from layout tags inside [${message.guild.name}]`);
+        await processDiscoveredMembers(message.guild, embedMap, 'NET_25_EMBED_MENTION_EXTRACT');
+      }
+    }
     return;
   }
 
-  // NET 3: Human Text Stream Catch
+  // Human Activity Streams
   if (message.member) {
     console.log(`🎙️ [NET 3: Active Chatter] -> Chat frame dropped by [${message.author.tag}] in [#${message.channel.name}] inside [${message.guild.name}]`);
     await processDiscoveredMembers(message.guild, new Map([[message.member.id, message.member]]), 'NET_3_LIVE_MESSAGE');
   }
 
-  // NET 4: Welcome Message System Core Mention Check
   if (message.mentions.members.size > 0) {
     console.log(`🎙️ [NET 4: Welcome Mention] -> Identity mentions broadcasted via chat lines inside [${message.guild.name}]`);
     await processDiscoveredMembers(message.guild, message.mentions.members, 'NET_4_WELCOME_SYSTEM_MENTIONS');
@@ -293,7 +443,6 @@ client.on('typingStart', async (channel, user) => {
 client.on('presenceUpdate', async (oldPres, newPres) => {
   if (!newPres || !newPres.guild || !newPres.member || newPres.user.bot) return;
   
-  // NET 21: Rich Presence Activity Tracker
   const oldActivities = oldPres?.activities?.map(a => a.name).join(',') || '';
   const newActivities = newPres.activities?.map(a => a.name).join(',') || '';
   if (oldActivities !== newActivities) {
@@ -302,19 +451,31 @@ client.on('presenceUpdate', async (oldPres, newPres) => {
     return;
   }
 
-  // NET 6: Standard Green Light Online Watcher
   console.log(`🎙️ [NET 6: Green Light Watcher] -> Connectivity status frame shift logged for [${newPres.user.tag}] inside [${newPres.guild.name}]`);
   await processDiscoveredMembers(newPres.guild, new Map([[newPres.member.id, newPres.member]]), 'NET_6_PRESENCE_STATUS_SHIFT');
 });
 
-// NET 7: Emoji Reactions Tracker
+// NET 7, NET 28 & NET 29: Reaction Array, Sticker Component, and Bot Embed Reaction Role Watchers
 client.on('messageReactionAdd', async (reaction, user) => {
   if (!reaction.message.guild || user.bot) return;
   const member = await reaction.message.guild.members.fetch(user.id).catch(() => null);
-  if (member) {
-    console.log(`🎙️ [NET 7: Emoji Clicker] -> Reaction array verification clicked by [${user.tag}] in [${reaction.message.guild.name}]`);
-    await processDiscoveredMembers(reaction.message.guild, new Map([[member.id, member]]), 'NET_7_EMOJI_REACTION_HOOK');
+  if (!member) return;
+
+  // NET 28: Sticker-based reaction identifier verification
+  if (reaction.emoji.id) {
+    console.log(`🎙️ [NET 28: Sticker Reactor] -> Custom interactive sticker tracked from user [${user.tag}] in [${reaction.message.guild.name}]`);
+    await processDiscoveredMembers(reaction.message.guild, new Map([[member.id, member]]), 'NET_28_STICKER_REACTION');
   }
+
+  // NET 29: Verification Bot Selector Component Interception
+  if (reaction.message.embeds && reaction.message.embeds.length > 0) {
+    console.log(`🎙️ [NET 29: Role Assignment Trigger] -> User [${user.tag}] interacting with system menu arrays in [${reaction.message.guild.name}]`);
+    await processDiscoveredMembers(reaction.message.guild, new Map([[member.id, member]]), 'NET_29_ROLE_SELECTOR_INTERACTION');
+  }
+
+  // NET 7: Standard Emoji Reaction Hook
+  console.log(`🎙️ [NET 7: Emoji Clicker] -> Reaction array verification clicked by [${user.tag}] in [${reaction.message.guild.name}]`);
+  await processDiscoveredMembers(reaction.message.guild, new Map([[member.id, member]]), 'NET_7_EMOJI_REACTION_HOOK');
 });
 
 // NET 8: Sub-Thread Activity Watcher
@@ -338,12 +499,9 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   if (newState.channelId) {
     const isMicroShift = oldState.channelId === newState.channelId;
     
-    // NET 18: Microphone/Camera Twitch Watcher
     if (isMicroShift) {
       console.log(`🎙️ [NET 18: Microphone Twitch] -> Device toggle action (Mute/Stream) tracked for [${newState.member.user.tag}] in [${newState.guild.name}]`);
       await processDiscoveredMembers(newState.guild, new Map([[newState.member.id, newState.member]]), 'NET_18_VOICE_MICRO_MUTATION');
-    
-    // NET 9: Standard Voice Room Entry Catch
     } else {
       console.log(`🎙️ [NET 9: Voice Channel Hopper] -> Auditory grid connection slot taken by [${newState.member.user.tag}] inside [${newState.guild.name}]`);
       await processDiscoveredMembers(newState.guild, new Map([[newState.member.id, newState.member]]), 'NET_9_VOICE_ROOM_CONNECT');
@@ -351,22 +509,39 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   }
 });
 
-// NET 10: Global User Account Profile Monitor
+// NET 10 Handler Fix: Implemented linear asynchronous handling across loops rather than fire-and-forget loops
 client.on('userUpdate', async (oldUser, newUser) => {
   if (newUser.bot) return;
-  client.guilds.cache.forEach((guild) => {
+  
+  for (const guild of client.guilds.cache.values()) {
     const member = guild.members.cache.get(newUser.id);
     if (member) {
       console.log(`🎙️ [NET 10: Global Identity Update] -> Global account layout adjustment synced for user [${newUser.tag}] inside [${guild.name}]`);
-      processDiscoveredMembers(guild, new Map([[member.id, member]]), 'NET_10_GLOBAL_USER_PROFILE_SYNC').catch(() => {});
+      await processDiscoveredMembers(guild, new Map([[member.id, member]]), 'NET_10_GLOBAL_USER_PROFILE_SYNC').catch((err) => {
+        console.error(`❌ [NET 10 Error] Profiler tracking step faulted in ${guild.name}:`, err.message);
+      });
     }
-  });
+  }
+});
+
+// NET 23: Outage Recovery & Channel Availability Interceptor
+client.on('guildUpdate', async (oldGuild, newGuild) => {
+  if (!oldGuild.available && newGuild.available) {
+    console.log(`📡 [NET 23: Guild Revive Sync] -> Workspace [${newGuild.name}] regained cluster connection. Syncing cached state records...`);
+    try {
+      const recoveredMembers = await newGuild.members.fetch().catch(() => null);
+      if (recoveredMembers && recoveredMembers.size > 0) {
+        await processDiscoveredMembers(newGuild, recoveredMembers, 'NET_23_GUILD_AVAILABILITY_RECOVERY');
+      }
+    } catch (err) {
+      console.error(`❌ [NET 23 Engine Failure] State restoration aborted for [${newGuild.name}]:`, err.message);
+    }
+  }
 });
 
 // NET 11, NET 12 & NET 13: Direct Raw Packet Exception Decoders
 client.on('raw', async (packet) => {
   try {
-    // NET 11: Direct Cache Chunk Interception Layer
     if (packet.t === 'GUILD_MEMBERS_CHUNK') {
       const { guild_id, members } = packet.d;
       const guild = client.guilds.cache.get(guild_id);
@@ -385,7 +560,6 @@ client.on('raw', async (packet) => {
       }
     }
 
-    // NET 12: Structural Join Fallback Packet Interceptor
     if (packet.t === 'GUILD_MEMBER_ADD') {
       const { guild_id, user } = packet.d;
       const guild = client.guilds.cache.get(guild_id);
@@ -396,7 +570,6 @@ client.on('raw', async (packet) => {
       }
     }
 
-    // NET 13: Structural Profile Fallback Packet Interceptor
     if (packet.t === 'GUILD_MEMBER_UPDATE') {
       const { guild_id, user } = packet.d;
       const guild = client.guilds.cache.get(guild_id);
@@ -405,21 +578,26 @@ client.on('raw', async (packet) => {
         if (m) await processDiscoveredMembers(guild, new Map([[m.id, m]]), 'NET_13_RAW_STRUCTURAL_UPDATE_FALLBACK');
       }
     }
-  } catch (err) {}
+  } catch (err) {
+    console.error(`❌ [RAW PACKET PROCESSING EXCEPTION] Engine encountered fault decoding stream sequence:`, err.message);
+  }
 });
 
 // NET 14: Dynamic Workspace Add Sync Hook
 client.on('guildCreate', (guild) => {
   console.log(`📥 [NET 14: New Server Surveyor] -> Selfbot registered cluster attachment inside: [${guild.name}]. Initiating entry scan...`);
-  setTimeout(() => pollGuildActiveEngine(guild).catch(() => {}), 5000);
+  setTimeout(() => pollGuildActiveEngine(guild).catch((err) => console.error(`❌ [NET 14 Error] Entry scan crash context:`, err.message)), 5000);
 });
 
-// NET 15: Pinned Message Chat Sweep Hook
+// NET 15: Pinned Message Chat Sweep Hook (With complete visibility check logs)
 client.on('channelPinsUpdate', async (channel) => {
   if (!channel.guild) return;
   console.log(`🎙️ [NET 15: Pin-Board Sneak] -> Channel pinned layout modification tracked inside [#${channel.name}] in [${channel.guild.name}]. Scraping local chat lines...`);
   try {
-    const recentMessages = await channel.messages.fetch({ limit: 10 }).catch(() => null);
+    const recentMessages = await channel.messages.fetch({ limit: 10 }).catch((err) => {
+      console.error(`❌ [NET 15 Error] Failed pinning sweep query inside channel [#${channel.name}]:`, err.message);
+      return null;
+    });
     if (!recentMessages) return;
 
     const collectedMap = new Map();
@@ -428,7 +606,9 @@ client.on('channelPinsUpdate', async (channel) => {
     });
 
     if (collectedMap.size > 0) await processDiscoveredMembers(channel.guild, collectedMap, 'NET_15_CHANNEL_PIN_PROXIMITY_SWEEP');
-  } catch (err) {}
+  } catch (err) {
+    console.error(`❌ [NET 15 Final Catch] Unexpected runtime exception during sweep:`, err.message);
+  }
 });
 
 // NET 16: Thread Initiation Trigger Hook
@@ -442,7 +622,9 @@ client.on('threadCreate', async (thread) => {
     if (member && !member.user.bot) {
       await processDiscoveredMembers(thread.guild, new Map([[member.id, member]]), 'NET_16_THREAD_INITIATION_HOOK');
     }
-  } catch (err) {}
+  } catch (err) {
+    console.error(`❌ [NET 16 Error] Thread parsing operation failed context:`, err.message);
+  }
 });
 
 // NET 17: Interactive Bot Grid Component Watcher
@@ -457,16 +639,35 @@ client.on('interactionCreate', async (interaction) => {
 // ────────────────────────────────────────────────────────
 client.on('ready', async () => {
   console.log(`\n============================================================`);
+  console.log(`⏳ [Startup Verification] Testing upstream cloud dependencies...`);
+  
+  try {
+    await redis.get('global:start_time'); 
+    console.log('✅ [Dependency Check] Upstash Redis connectivity verified.');
+  } catch (err) {
+    console.error('❌ [CRITICAL DEPENDENCY FAULT] Upstream database validation failed!');
+    console.error(`Reason: ${err.message}`);
+    console.error('Terminating engine process to prevent unlogged packet leakage.');
+    process.exit(1); 
+  }
+
+  START_TIME = await getStartTime(); 
+  
   console.log(`🤖 FISHTANK ENGINE LOADED: ONLINE AND ACTIVE AS [${client.user.tag}]`);
-  console.log(`📊 Matrix Infrastructure: 22 Specific Tracking Nets Configured Across ${client.guilds.cache.size} Servers.`);
+  console.log(`📊 Matrix Infrastructure: 30 Specific Tracking Nets Configured Across ${client.guilds.cache.size} Servers.`);
   console.log(`============================================================`);
-  START_TIME = await getStartTime();
+  
+  // Launch Active Polling Loop
   startActiveLoopCycle(); 
+  
+  // Launch Advanced Scheduler Background Recurrences (Staggered Offsets)
+  setTimeout(syncChannelMembersLoop, 10000);
+  setTimeout(scanScheduledEventsLoop, 30000);
 });
 
 client.on('guildDelete', (guild) => {
   console.log(`➖ [Cluster Adjustment] Dropped connection from server [${guild.name}]. Cleaning up database footprint tables...`);
-  redis.del(`guild:${guild.id}:members`).catch(() => {});
+  redis.del(`guild:${guild.id}:members`).catch((err) => console.error(`❌ [Guild Eviction Database Error] Key erasure failed for [${guild.id}]:`, err.message));
 });
 
 client.on('shardDisconnect', (event, shardId) => {
@@ -481,7 +682,7 @@ client.on('shardDisconnect', (event, shardId) => {
 // 🌐 LIVE HOST HEALTH CHECK & TELEMETRY API
 // ────────────────────────────────────────────────────────
 const app = express();
-app.get('/', (req, res) => res.json({ status: 'always_fishing', running_nets: 22, tracked_guilds: client.guilds.cache.size }));
+app.get('/', (req, res) => res.json({ status: 'always_fishing', running_nets: 30, tracked_guilds: client.guilds.cache.size }));
 app.get('/stats', async (req, res) => {
   try {
     const guilds = [...client.guilds.cache.values()];
