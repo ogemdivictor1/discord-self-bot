@@ -5,13 +5,13 @@ const { Client } = require('discord.js-selfbot-v13');
 const axios = require('axios');
 const { Redis } = require('@upstash/redis');
 
-// Redis
+// Redis Setup
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-// Proxy (optional)
+// Proxy Setup
 const proxyUrl = process.env.PROXY_URL;
 let httpsAgent = null;
 if (proxyUrl) {
@@ -22,13 +22,10 @@ const clientOptions = {};
 if (proxyUrl) clientOptions.ws = { agent: httpsAgent };
 const client = new Client(clientOptions);
 
-// Config
-const POLL_INTERVAL_SEC = 120;
-const CHUNK_SIZE = 1000;
-const PAGE_DELAY_MS = 2000;
+// Configuration
+const POLL_INTERVAL_SEC = 600;
 const GRACE_PERIOD_MS = 5 * 60 * 1000;
 
-let pollingInterval = null;
 let START_TIME = null;
 
 // Persistent start time
@@ -52,8 +49,12 @@ function randomDelay(min, max) {
 
 async function simulateActivity() {
   if (Math.random() > 0.7) {
-    await client.user.setStatus('online');
-    console.log('📍 Simulated activity');
+    try {
+      await client.user.setStatus('online');
+      console.log('📍 Simulated client activity heartbeat');
+    } catch (err) {
+      console.error('⚠️ Failed to simulate activity status:', err.message);
+    }
   }
 }
 
@@ -71,120 +72,108 @@ async function sendNotification(payload, maxRetries = 3) {
   }
 }
 
-// Chunked fetch
-async function fetchAllMembersInChunks(guild) {
-  const members = new Map();
-  let lastUserId = undefined;
-  let page = 0;
-  console.log(`[FETCH] ${guild.name} (~${guild.memberCount} members) – chunked ${CHUNK_SIZE}/page`);
-
-  while (true) {
-    try {
-      const options = { limit: CHUNK_SIZE, withPresences: false };
-      if (lastUserId) options.after = lastUserId;
-      const chunk = await guild.members.fetch(options);
-      if (chunk.size === 0) break;
-      for (const [id, member] of chunk) members.set(id, member);
-      lastUserId = chunk.lastKey();
-      page++;
-      console.log(`   Page ${page}: +${chunk.size} (total ${members.size})`);
-      if (chunk.size < CHUNK_SIZE) break;
-      await randomDelay(PAGE_DELAY_MS, PAGE_DELAY_MS + 500);
-    } catch (err) {
-      console.error(`[CHUNK ERROR] ${guild.name}:`, err.message);
-      break;
-    }
-  }
-
-  if (members.size === 0 && guild.memberCount > 5000) {
-    console.log(`[NOTE] ${guild.name} is a large server (${guild.memberCount}+ members) — Discord limits full member list fetch for regular user accounts. Real-time cache detection still active.`);
-  }
-
-  console.log(`[DONE] ${guild.name} → ${members.size} members`);
-  return members;
-}
-
-// Poll guild
-async function pollGuild(guild) {
-  console.log(`\n🔍 Polling ${guild.name}...`);
+// -------------------- OPTIMIZED ACTIVE MEMBER POLL --------------------
+async function pollActiveMembersOnly(guild) {
   const pollStart = Date.now();
-  const members = await fetchAllMembersInChunks(guild);
-  if (members.size === 0) return;
-
-  const guildKey = `guild:${guild.id}:members`;
-  const isFirstScan = (await redis.exists(guildKey)) === 0;
-
-  const memberIds = Array.from(members.keys());
-  const pipeline = redis.pipeline();
-  for (const id of memberIds) {
-    pipeline.sismember(guildKey, id);
-  }
-
-  let results;
   try {
-    results = await pipeline.exec();
-  } catch (err) {
-    console.error(`[PIPELINE ERROR] ${guild.name}:`, err.message);
-    return;
-  }
+    // 1. Before fetch log
+    console.log(`📡 Sending sidebar request to Discord for ${guild.name}...`);
 
-  const newIds = [];
-  const notifications = [];
-  let idx = 0;
+    const activeMembers = await guild.members.fetch({
+      query: '',
+      limit: 250,
+      withPresences: true,
+      force: true
+    });
 
-  for (const [id, member] of members) {
-    const isKnown = results[idx++];
-    if (!isKnown) {
-      newIds.push(id);
+    if (!activeMembers || activeMembers.size === 0) {
+      console.log(`⚠️ No active members returned for ${guild.name}.`);
+      return;
+    }
+
+    // 2. After fetch success log
+    console.log(`✅ Discord responded with ${activeMembers.size} active members for ${guild.name}`);
+
+    const guildKey = `guild:${guild.id}:members`;
+    const effectiveStart = START_TIME - GRACE_PERIOD_MS;
+
+    const memberArray = Array.from(activeMembers.values());
+    const pipeline = redis.pipeline();
+
+    for (const member of memberArray) {
+      pipeline.sismember(guildKey, member.id);
+    }
+
+    // 3. During Redis pipeline log
+    console.log(`🔍 Checking ${memberArray.length} members against Redis...`);
+    const redisResults = await pipeline.exec();
+
+    const newIdsToTrack = [];
+    const notifications = [];
+
+    for (let i = 0; i < memberArray.length; i++) {
+      const member = memberArray[i];
+      const isKnown = redisResults[i];
       const joinedAt = member.joinedAt?.getTime() ?? 0;
-      const effectiveStart = START_TIME - GRACE_PERIOD_MS;
 
-      if (!isFirstScan && joinedAt > effectiveStart) {
-        console.log(`🆕 NEW member: ${member.user.tag} (joined ${new Date(joinedAt).toISOString()})`);
+      if (joinedAt > effectiveStart && !isKnown) {
+        newIdsToTrack.push(member.id);
+        console.log(`🆕 Active Join: ${member.user.tag} (Joined ${new Date(joinedAt).toISOString()})`);
+
         notifications.push({
           server: guild.name,
           serverId: guild.id,
           userId: member.user.id,
           username: member.user.tag,
           joinedAt: new Date(joinedAt).toISOString(),
-          source: 'poll'
+          source: 'active_sidebar'
         });
-      } else {
-        console.log(`📦 ${isFirstScan ? 'Baseline' : 'Old'} member: ${member.user.tag}`);
       }
     }
-  }
 
-  if (newIds.length) {
-    await redis.sadd(guildKey, ...newIds);
-  }
-  await Promise.all(notifications.map(payload => sendNotification(payload)));
+    // 4. After Redis results log
+    console.log(`📊 Redis check complete — ${newIdsToTrack.length} new, ${memberArray.length - newIdsToTrack.length} already known`);
 
-  const elapsed = ((Date.now() - pollStart) / 1000).toFixed(1);
-  console.log(`[${guild.name}] ${isFirstScan ? 'BASELINE' : 'Incremental'} done in ${elapsed}s – ${members.size} total, ${newIds.length} new, ${notifications.length} notified`);
+    if (newIdsToTrack.length > 0) {
+      // 5. Before saving to Redis log
+      console.log(`💾 Saving ${newIdsToTrack.length} new member IDs to Redis...`);
+      await redis.sadd(guildKey, ...newIdsToTrack);
+    }
+
+    if (notifications.length > 0) {
+      // 6. Before sending notifications log
+      console.log(`📨 Sending ${notifications.length} notifications to CYPHER XXD...`);
+      await Promise.all(notifications.map(payload => sendNotification(payload)));
+    }
+
+    const elapsed = ((Date.now() - pollStart) / 1000).toFixed(1);
+    console.log(`[${guild.name}] Checked ${activeMembers.size} members in ${elapsed}s. Sent ${notifications.length} alerts.`);
+
+  } catch (err) {
+    console.error(`❌ Active fetch failed for ${guild.name}:`, err.message);
+  }
 }
 
-// Polling scheduler
-async function runBackupPoll() {
+// -------------------- POLL SCHEDULER --------------------
+async function runActivePollCycle() {
   const guilds = [...client.guilds.cache.values()];
-  console.log(`\n🔄 Starting poll cycle (${guilds.length} guilds)...`);
-  for (let i = 0; i < guilds.length; i++) {
-    setTimeout(() => pollGuild(guilds[i]), i * 2000);
+  console.log(`\n🔄 Starting active member scan across ${guilds.length} servers...`);
+
+  for (const guild of guilds) {
+    await pollActiveMembersOnly(guild);
+    await randomDelay(4000, 7000);
   }
+
   await simulateActivity();
+  console.log(`\n🏁 Scan cycle complete. Resting for ${POLL_INTERVAL_SEC} seconds.`);
+  setTimeout(runActivePollCycle, POLL_INTERVAL_SEC * 1000);
 }
 
-function startPolling() {
-  if (pollingInterval) clearInterval(pollingInterval);
-  pollingInterval = setInterval(runBackupPoll, POLL_INTERVAL_SEC * 1000);
-  console.log(`⏱️ Polling every ${POLL_INTERVAL_SEC}s (chunked, ${CHUNK_SIZE}/page, ${PAGE_DELAY_MS}ms delay)`);
-}
-
-// Discord events
+// -------------------- DISCORD EVENTS --------------------
 client.on('ready', async () => {
   START_TIME = await getStartTime();
-  console.log(`\n🤖 Selfbot: ${client.user.tag} | ${client.guilds.cache.size} servers`);
-  startPolling();
+  console.log(`\n🤖 Selfbot Active Monitor: ${client.user.tag} | Watching ${client.guilds.cache.size} servers`);
+  runActivePollCycle();
 });
 
 client.on('guildDelete', (guild) => {
@@ -192,22 +181,24 @@ client.on('guildDelete', (guild) => {
   console.log(`➖ Left: ${guild.name}`);
 });
 
-// shardDisconnect — detects token death
+// -------------------- TOKEN EXPIRY --------------------
 client.on('shardDisconnect', (event, shardId) => {
-  console.error(`🔴 SHARD DISCONNECTED (shard ${shardId}): code=${event.code} reason=${event.reason}`);
-  if (event.code === 4004) {
-    console.error('================================');
-    console.error('🔴 TOKEN EXPIRED – update USER_TOKEN immediately');
-    console.error('================================');
+  if (event?.code === 4004) {
+    console.error('================================================');
+    console.error(`🔴 TOKEN EXPIRED (shard ${shardId}) — Update USER_TOKEN!`);
+    console.error('================================================');
+  } else {
+    console.warn(`⚠️ Shard ${shardId} disconnected: code=${event?.code || 'Unknown'}`);
   }
 });
 
-// Health + Stats endpoints
+// -------------------- HEALTH + STATS --------------------
 const app = express();
 
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
+    mode: 'active_sidebar_only',
     guilds: client.guilds.cache.size,
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString()
@@ -239,29 +230,21 @@ app.get('/stats', async (req, res) => {
   }
 });
 
-app.listen(3000, () => console.log('✅ Health server on :3000'));
+app.listen(3000, () => console.log('✅ Health server listening on port 3000'));
 
-// Error handling
-process.on('unhandledRejection', (err) => {
+// -------------------- GLOBAL EXCEPTION SAFETY --------------------
+function handleFatalError(err) {
   const msg = err.message?.toLowerCase() || '';
-  if (msg.includes('invalid token')) {
-    console.error('================================');
-    console.error('🔴 TOKEN EXPIRED – update USER_TOKEN');
-    console.error('================================');
+  if (msg.includes('invalid token') || msg.includes('401: unauthorized')) {
+    console.error('================================================');
+    console.error('🔴 CRITICAL TOKEN EXPIRED — Update USER_TOKEN immediately.');
+    console.error('================================================');
   } else {
-    console.error('⚠️ Unhandled rejection:', err.message);
+    console.error('⚠️ Runtime Exception intercepted:', err.message);
   }
-});
+}
 
-process.on('uncaughtException', (err) => {
-  const msg = err.message?.toLowerCase() || '';
-  if (msg.includes('invalid token')) {
-    console.error('================================');
-    console.error('🔴 TOKEN EXPIRED – update USER_TOKEN');
-    console.error('================================');
-  } else {
-    console.error('⚠️ Uncaught exception:', err.message);
-  }
-});
+process.on('unhandledRejection', handleFatalError);
+process.on('uncaughtException', handleFatalError);
 
 client.login(process.env.USER_TOKEN);
