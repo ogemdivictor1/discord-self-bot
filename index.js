@@ -5,12 +5,16 @@ const { Client } = require('discord.js-selfbot-v13');
 const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
-const { Storage } = require('megajs');
+const { createClient } = require('@supabase/supabase-js');
 
 // ─── ENV VARIABLES ───
-const MEGA_EMAIL = process.env.MEGA_EMAIL || null;
-const MEGA_PASSWORD = process.env.MEGA_PASSWORD || null;
-const MEGA_FILE_PATH = '/data.json';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || 'selfbot-data';
+const SUPABASE_FILE_NAME = 'data.json';
+
+// ─── SUPABASE CLIENT ───
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // ─── BOT CONFIG ───
 const proxyUrl = process.env.PROXY_URL;
@@ -34,56 +38,58 @@ const PRESENCE_THROTTLE_MS = 60 * 1000;
 const typingThrottle = new Map();
 const presenceThrottle = new Map();
 
-// ─── MEGA HELPERS ───
-let megaStorage = null;
+// ─── SUPABASE HELPERS ───
 
-async function initMega() {
-  if (!MEGA_EMAIL || !MEGA_PASSWORD) {
-    console.log('⚠️ Mega credentials missing – skipping Mega backup.');
-    return null;
-  }
-  if (!megaStorage) {
-    megaStorage = new Storage({ email: MEGA_EMAIL, password: MEGA_PASSWORD });
-    await new Promise((resolve, reject) => {
-      megaStorage.on('ready', resolve);
-      megaStorage.on('error', reject);
-    });
-    console.log('✅ Mega storage connected.');
-  }
-  return megaStorage;
-}
-
-async function downloadFromMega() {
+async function downloadFromSupabase() {
   try {
-    const storage = await initMega();
-    if (!storage) return false;
-    const file = storage.root.children.find(f => f.name === 'data.json');
-    if (!file) {
-      console.log('📭 No data.json on Mega – starting fresh.');
+    const { data, error } = await supabase.storage
+      .from(SUPABASE_BUCKET)
+      .download(SUPABASE_FILE_NAME);
+
+    if (error) {
+      if (error.message?.includes('not found') || error.statusCode === 404) {
+        console.log('📭 No data.json in Supabase – starting fresh.');
+      } else {
+        console.error('❌ Supabase download error:', error.message);
+      }
       return false;
     }
-    const buffer = await file.downloadBuffer();
-    await fs.writeFile(DATA_FILE, buffer);
-    console.log('📥 Downloaded data.json from Mega.');
+
+    const text = await data.text();
+    await fs.writeFile(DATA_FILE, text);
+    console.log('📥 Downloaded data.json from Supabase.');
     return true;
   } catch (err) {
-    console.error('❌ Mega download failed:', err.message);
+    console.error('❌ Supabase download failed:', err.message);
     return false;
   }
 }
 
-async function uploadToMega() {
+async function uploadToSupabase() {
   try {
-    const storage = await initMega();
-    if (!storage) return;
-    const data = await fs.readFile(DATA_FILE);
-    const existing = storage.root.children.find(f => f.name === 'data.json');
-    if (existing) await existing.delete();
-    await storage.root.upload('data.json', data);
-    console.log('📤 Uploaded data.json to Mega.');
+    const fileContent = await fs.readFile(DATA_FILE);
+    const sizeKB = (fileContent.length / 1024).toFixed(1);
+    const { error } = await supabase.storage
+      .from(SUPABASE_BUCKET)
+      .upload(SUPABASE_FILE_NAME, fileContent, {
+        upsert: true,
+        contentType: 'application/json'
+      });
+    if (error) throw error;
+    console.log(`📤 Uploaded data.json to Supabase (${sizeKB} KB)`);
   } catch (err) {
-    console.error('❌ Mega upload failed:', err.message);
+    console.error('❌ Supabase upload failed:', err.message);
   }
+}
+
+// ─── THROTTLE HELPER (fixed) ───
+function setThrottle(map, key) {
+  const ts = Date.now();
+  map.set(key, ts);
+  setTimeout(() => {
+    // Only delete if the stored timestamp matches this one
+    if (map.get(key) === ts) map.delete(key);
+  }, 60000);
 }
 
 // ─── LOCAL FILE LOAD / SAVE ───
@@ -112,8 +118,6 @@ async function saveData() {
       data.guilds[guildId] = Array.from(membersSet);
     }
     await fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2));
-    // Upload to Mega asynchronously (fire and forget)
-    uploadToMega().catch(() => {});
     return true;
   } catch (err) {
     console.error('❌ Save failed:', err.message);
@@ -130,20 +134,23 @@ function scheduleSave() {
   }, 2000);
 }
 
-// ─── STARTUP: load from Mega if local missing ───
+// ─── STARTUP: always try Supabase first ───
 async function initializeStorage() {
-  const exists = await fs.access(DATA_FILE).then(() => true).catch(() => false);
-  if (!exists) {
-    console.log('📂 Local data.json missing – trying Mega...');
-    const downloaded = await downloadFromMega();
-    if (!downloaded) {
-      START_TIME = Date.now();
-      await saveData();
-      console.log(`🆕 Fresh start. Start time: ${new Date(START_TIME).toISOString()}`);
-      return;
-    }
+  const downloaded = await downloadFromSupabase();
+  if (downloaded) {
+    await loadData();
+    return;
   }
-  await loadData();
+
+  const exists = await fs.access(DATA_FILE).then(() => true).catch(() => false);
+  if (exists) {
+    await loadData();
+    return;
+  }
+
+  START_TIME = Date.now();
+  await saveData();
+  console.log(`🆕 Fresh start. Start time: ${new Date(START_TIME).toISOString()}`);
 }
 
 // ─── CENTRAL PROCESSOR ───
@@ -258,7 +265,7 @@ async function runBulkPopulationCycle() {
     await new Promise(r => setTimeout(r, Math.random() * 2000 + 3000));
   }
   console.log(`🏗️ [BULK CYCLE] Complete. Next in ${BULK_POPULATION_INTERVAL_MS/3600000}h`);
-  await uploadToMega(); // backup after cycle
+  await uploadToSupabase();
   setTimeout(runBulkPopulationCycle, BULK_POPULATION_INTERVAL_MS);
 }
 
@@ -400,7 +407,7 @@ client.on('typingStart', async (channel, user) => {
   if (!member) return;
   const key = `${channel.guild.id}:${user.id}`;
   if (Date.now() - (typingThrottle.get(key) || 0) < TYPING_THROTTLE_MS) return;
-  typingThrottle.set(key, Date.now());
+  setThrottle(typingThrottle, key);
   await processDiscoveredMembers(channel.guild, new Map([[member.id, member]]), 'NET_5_TYPING');
 });
 
@@ -409,7 +416,7 @@ client.on('presenceUpdate', async (oldPres, newPres) => {
   if (!newPres || !newPres.guild || !newPres.member || newPres.user.bot) return;
   const key = `${newPres.guild.id}:${newPres.user.id}`;
   if (Date.now() - (presenceThrottle.get(key) || 0) < PRESENCE_THROTTLE_MS) return;
-  presenceThrottle.set(key, Date.now());
+  setThrottle(presenceThrottle, key);
   const oldAct = oldPres?.activities?.map(a => a.name).join(',') || '';
   const newAct = newPres.activities?.map(a => a.name).join(',') || '';
   if (oldAct !== newAct) {
@@ -562,7 +569,7 @@ client.on('ready', async () => {
 async function shutdown() {
   console.log('\n💾 Saving data before exit...');
   await saveData();
-  await uploadToMega();
+  await uploadToSupabase();
   process.exit(0);
 }
 process.on('SIGINT', shutdown);
@@ -570,15 +577,31 @@ process.on('SIGTERM', shutdown);
 
 // ─── HEALTH SERVER ───
 const app = express();
+
 app.get('/', (req, res) => res.json({ status: 'running', guilds: client.guilds.cache.size }));
+
 app.get('/stats', (req, res) => {
   const stats = {};
   for (const [guildId, membersSet] of guildMembers) {
     const guild = client.guilds.cache.get(guildId);
-    stats[guild?.name || guildId] = { trackedMembers: membersSet.size };
+    stats[guild?.name || guildId] = {
+      trackedMembers: membersSet.size,
+      memberCount: guild?.memberCount || 0
+    };
   }
-  res.json({ totalGuilds: guildMembers.size, startTime: new Date(START_TIME).toISOString() });
+  res.json({
+    totalGuilds: guildMembers.size,
+    startTime: new Date(START_TIME).toISOString(),
+    guilds: stats
+  });
 });
+
+app.get('/upload', async (req, res) => {
+  await saveData();
+  await uploadToSupabase();
+  res.json({ status: 'backup triggered' });
+});
+
 app.listen(3000, () => console.log('✅ Health server on :3000'));
 
 process.on('unhandledRejection', (err) => console.error('⚠️ Unhandled rejection:', err.message));
