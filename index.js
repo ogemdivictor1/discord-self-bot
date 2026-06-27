@@ -193,7 +193,11 @@ async function processDiscoveredMembers(guild, memberMap, sourceLabel) {
     const joinedAt = member.joinedAt?.getTime() ?? 0;
     if (joinedAt > effectiveStart) {
       const ageMinutes = Math.floor((Date.now() - joinedAt) / 60000);
-      console.log(`🎯 [NEW] ${member.user.tag} joined ${ageMinutes} min ago via [${sourceLabel}] in ${guild.name}`);
+     console.log(`🎯 [TIMESTAMP HIT] -> NEW: [${member.user.tag}] joined ${ageMinutes} min ago`);
+console.log(`   📅 joinedAt: ${new Date(joinedAt).toISOString()}`);
+console.log(`   ⏰ START_TIME: ${new Date(START_TIME).toISOString()}`);
+console.log(`   ✅ joinedAt > START_TIME: ${joinedAt > START_TIME}`);
+console.log(`   📡 Source: [${sourceLabel}] in [${guild.name}]`);
       notifications.push({
         server: guild.name,
         serverId: guild.id,
@@ -399,10 +403,9 @@ client.on('messageCreate', async (message) => {
     await processDiscoveredMembers(message.guild, message.mentions.members, 'NET_4_MENTIONS');
   }
 });
-
 // NET 5: typingStart (throttled)
 client.on('typingStart', async (channel, user) => {
-  if (!channel.guild || user.bot) return;
+  if (!channel.guild || !user || user.bot) return;
   const member = channel.guild.members.cache.get(user.id);
   if (!member) return;
   const key = `${channel.guild.id}:${user.id}`;
@@ -410,10 +413,9 @@ client.on('typingStart', async (channel, user) => {
   setThrottle(typingThrottle, key);
   await processDiscoveredMembers(channel.guild, new Map([[member.id, member]]), 'NET_5_TYPING');
 });
-
 // NET 6 & 21: presenceUpdate (throttled)
 client.on('presenceUpdate', async (oldPres, newPres) => {
-  if (!newPres || !newPres.guild || !newPres.member || newPres.user.bot) return;
+  if (!newPres || !newPres.guild || !newPres.member || !newPres.user || newPres.user.bot) return;
   const key = `${newPres.guild.id}:${newPres.user.id}`;
   if (Date.now() - (presenceThrottle.get(key) || 0) < PRESENCE_THROTTLE_MS) return;
   setThrottle(presenceThrottle, key);
